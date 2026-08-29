@@ -29,6 +29,14 @@ omarchy plugin add https://github.com/r404r/omarchy-pane-ratio.git --enable
 
 setup スクリプトや Hyprland の再読み込みは不要です。バックエンドはインストール済みのプラグインディレクトリから直接実行されます。
 
+## アンインストール
+
+```bash
+omarchy plugin remove io.github.r404r.pane-ratio
+```
+
+アンインストールに `sudo` は不要で、Hyprland のキーバインドや setup の設定ブロックも残りません。保存済みの比率指定と Omarchy のワークスペースレイアウト選択は、ユーザー状態として保持されます。保存済み比率も破棄したい場合に限り、`~/.local/state/omarchy-pane-ratio/` を手動で削除してください。
+
 ## 使い方
 
 Pane Ratio アイコンをクリックし、プリセットを選択します。ルールは現在のワークスペースに属し、2 枚目のウィンドウが現れる前でも選択できます。

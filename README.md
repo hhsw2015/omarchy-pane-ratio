@@ -29,6 +29,14 @@ omarchy plugin add https://github.com/r404r/omarchy-pane-ratio.git --enable
 
 No setup script or Hyprland reload is required. The backend runs directly from the installed plugin directory.
 
+## Remove
+
+```bash
+omarchy plugin remove io.github.r404r.pane-ratio
+```
+
+Removal needs no `sudo` and leaves no Hyprland binding or setup block behind. Saved ratio intentions and Omarchy's per-workspace layout choices remain as user state. Remove `~/.local/state/omarchy-pane-ratio/` manually only if you also want to discard the saved ratios.
+
 ## Use
 
 Click the Pane Ratio icon, then choose a preset. The rule belongs to the current workspace. It can be selected before the second window exists.

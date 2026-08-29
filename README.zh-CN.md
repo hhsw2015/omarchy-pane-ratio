@@ -29,6 +29,14 @@ omarchy plugin add https://github.com/r404r/omarchy-pane-ratio.git --enable
 
 无需运行 setup 脚本，也无需重新加载 Hyprland。后端直接从已安装的插件目录运行。
 
+## 卸载
+
+```bash
+omarchy plugin remove io.github.r404r.pane-ratio
+```
+
+卸载不需要 `sudo`，也不会遗留 Hyprland 快捷键或 setup 配置块。已保存的比例意图和 Omarchy 的工作区布局选择会作为用户状态保留。只有在也想丢弃已保存比例时，才需要手工删除 `~/.local/state/omarchy-pane-ratio/`。
+
 ## 使用
 
 点击 Pane Ratio 图标，然后选择比例预设。规则属于当前工作区，也可以在第二个窗口出现前提前选择。
