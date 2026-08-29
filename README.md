@@ -1,5 +1,7 @@
 # Pane Ratio
 
+English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+
 Pane Ratio is an Omarchy bar plugin for choosing Dwindle or Scrolling per workspace, remembering a left-to-right ratio, and applying that ratio whenever Dwindle is safe to adjust.
 
 ![Pane Ratio on an empty Omarchy workspace](assets/pane-ratio-empty-workspace.webp)
