@@ -28,6 +28,8 @@ Panel {
   property string pendingRatio: ""
 
   readonly property var presets: ["1:2", "1:1", "2:1"]
+  readonly property var presetShares: [1 / 3, 1 / 2, 2 / 3]
+  readonly property var presetHints: ["Right focus", "Balanced", "Left focus"]
   readonly property int maxOutputChars: 16384
   readonly property string cliPath: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/io.github.r404r.pane-ratio/bin/pane-ratio"
@@ -43,7 +45,7 @@ Panel {
 
   function open() {
     root.controller.show()
-    root.focusIndex = 1
+    root.focusIndex = 0
     root.refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -179,7 +181,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(content.implicitHeight)
 
     PanelKeyCatcher {
@@ -277,21 +279,94 @@ Panel {
           Repeater {
             model: root.presets
 
-            Button {
+            Rectangle {
+              id: presetCard
               required property string modelData
               required property int index
+              readonly property bool selected: root.currentRatio === modelData
+              readonly property bool focused: root.focusIndex === index + 1
+              readonly property bool available: root.eligible && !root.busy
               width: (content.width - Style.space(16)) / 3
-              height: Style.space(46)
-              text: modelData
-              tooltipText: "Set tiled windows to " + modelData
-              bordered: root.currentRatio === modelData
-              focusable: true
-              hasCursor: root.focusIndex === index + 1
-              enabled: !root.busy && root.eligible
-              foreground: root.currentRatio === modelData ? root.accent : root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.applyRatio(modelData)
-              onHovered: function(hovered) { if (hovered) root.focusIndex = index + 1 }
+              height: Style.space(78)
+              radius: Math.max(4, Style.cornerRadius)
+              color: selected
+                ? Util.alpha(root.accent, 0.16)
+                : Util.alpha(root.foreground, focused ? 0.08 : 0.035)
+              border.width: selected || focused ? 1 : 0
+              border.color: selected ? root.accent : Util.alpha(root.foreground, 0.42)
+              opacity: available ? 1 : 0.48
+              Accessible.role: Accessible.Button
+              Accessible.name: modelData + " left to right, " + root.presetHints[index]
+              Accessible.description: selected ? "Current ratio" : "Apply ratio"
+
+              Column {
+                anchors.centerIn: parent
+                spacing: Style.space(6)
+
+                Rectangle {
+                  width: Style.space(64)
+                  height: Style.space(24)
+                  radius: Math.max(3, Style.cornerRadius - 1)
+                  color: "transparent"
+                  border.width: 1
+                  border.color: presetCard.selected
+                    ? root.accent
+                    : Util.alpha(root.foreground, 0.58)
+
+                  Rectangle {
+                    x: Style.space(3)
+                    y: Style.space(3)
+                    width: (parent.width - Style.space(8)) * root.presetShares[presetCard.index]
+                    height: parent.height - Style.space(6)
+                    radius: Math.max(2, Style.cornerRadius - 2)
+                    color: presetCard.selected
+                      ? root.accent
+                      : Util.alpha(root.foreground, 0.48)
+                  }
+
+                  Rectangle {
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(3)
+                    y: Style.space(3)
+                    width: (parent.width - Style.space(8))
+                      * (1 - root.presetShares[presetCard.index])
+                    height: parent.height - Style.space(6)
+                    radius: Math.max(2, Style.cornerRadius - 2)
+                    color: presetCard.selected
+                      ? Util.alpha(root.accent, 0.52)
+                      : Util.alpha(root.foreground, 0.22)
+                  }
+                }
+
+                Text {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  text: presetCard.modelData + "  ·  " + root.presetHints[presetCard.index]
+                  textFormat: Text.PlainText
+                  color: presetCard.selected ? root.accent : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: presetCard.selected
+                }
+              }
+
+              Text {
+                anchors.top: parent.top
+                anchors.right: parent.right
+                anchors.margins: Style.space(5)
+                text: String(index + 1)
+                color: root.mutedForeground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                enabled: presetCard.available
+                hoverEnabled: true
+                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: root.applyRatio(presetCard.modelData)
+                onEntered: root.focusIndex = presetCard.index + 1
+              }
             }
           }
         }
@@ -299,7 +374,7 @@ Panel {
         Text {
           visible: root.errorText !== ""
           width: parent.width
-          text: root.errorText
+          text: "Unavailable — " + root.errorText
           textFormat: Text.PlainText
           color: Color.urgent
           font.family: root.fontFamily
@@ -321,7 +396,7 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Shortcuts: 1 = 1:2 · 2 = 1:1 · 3 = 2:1 · R = refresh"
+          text: "Keys  1  2  3  choose a ratio   ·   R  refreshes"
           color: root.mutedForeground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
