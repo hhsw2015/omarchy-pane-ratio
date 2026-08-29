@@ -1,10 +1,11 @@
 # Pane Ratio
 
-Pane Ratio is an Omarchy bar plugin that remembers a left-to-right ratio for each workspace and applies it whenever the Dwindle layout is safe to adjust.
+Pane Ratio is an Omarchy bar plugin for choosing Dwindle or Scrolling per workspace, remembering a left-to-right ratio, and applying that ratio whenever Dwindle is safe to adjust.
 
 ## What it does
 
 - Offers `1:3`, `1:2`, `1:1`, `2:1`, and `3:1` presets from a compact bar panel.
+- Explicitly switches the current workspace between Dwindle and Scrolling and persists the choice in Omarchy's native workspace-layout state.
 - Saves the selected ratio even when the workspace has zero or one tiled window.
 - Automatically applies the saved ratio when a second tiled window appears.
 - Pauses without changing geometry when three or more tiled windows are present, then resumes after the workspace returns to two.
@@ -33,13 +34,16 @@ Keyboard controls inside the panel:
 - `1`–`9`: choose the preset at that position (the default list uses `1`–`5`)
 - `D`: forget the current workspace rule
 - `S`: switch two panes between left/right and top/bottom
+- `L`: switch the workspace between Dwindle and Scrolling
 - `R`: refresh
 - Arrow keys and Enter: navigate and apply
 - Escape: close
 
 `Waiting` means the intention is saved and needs a second tiled window. `Paused` means the rule is retained but the current topology is unsafe to change. The plugin never changes a three-window tree by approximation.
 
-The split button mirrors Omarchy's `Super+J` “Toggle window split” for the plugin's deliberately narrower two-pane case. A top/bottom split pauses a saved left/right ratio; switching back to left/right automatically reapplies that saved ratio. `Super+L` is different: it changes the whole workspace between Dwindle and Scrolling and is not controlled by this button.
+The Dwindle and Scrolling buttons mirror Omarchy's `Super+L` workspace-layout choice, but are explicit instead of blindly toggling. The choice is written to `~/.local/state/omarchy/workspace-layouts/`, the same location Omarchy reloads on startup. A saved ratio pauses in Scrolling and resumes when the workspace returns to Dwindle and has a safe two-pane topology.
+
+The split button mirrors Omarchy's `Super+J` “Toggle window split” for the plugin's deliberately narrower two-pane case. A top/bottom split pauses a saved left/right ratio; switching back to left/right automatically reapplies that saved ratio. Workspace layout and Dwindle split direction are separate controls.
 
 ## Custom presets
 
@@ -58,7 +62,7 @@ Use one to nine ratios. Each side must be an integer from 1 through 20. Ratios a
 ## Safety model
 
 - Ratio arguments are a fixed allowlist; arbitrary commands and arbitrary Lua are rejected.
-- State is bounded, schema-validated, symlink-resistant, private (`0700` directory and `0600` file), and atomically replaced.
+- Ratio state and Omarchy-compatible workspace layout rules are bounded, allowlisted, symlink-resistant, private (`0700` directories and `0600` files), and atomically replaced.
 - `hyprctl` output is parsed as bounded JSON with timeouts and schema checks.
 - Workspace, window addresses, focus, and layout are checked twice before applying.
 - The atomic Lua guard rechecks the window set, focus, Dwindle layout, split bias, groups, fullscreen state, and horizontal geometry immediately before dispatch. Pseudotile is not treated as a separate policy flag because Hyprland's Lua window API does not expose it; the same geometry eligibility applies.

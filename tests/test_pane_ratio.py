@@ -116,6 +116,7 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
             self.snapshots = snapshots
             self.call_index = 0
             self.expression = ""
+            self.expressions = []
             self.eval_error = eval_error
 
         def json(self, maximum_bytes, *arguments, deadline=None):
@@ -129,6 +130,7 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
 
         def eval(self, expression, *, deadline=None):
             self.expression = expression
+            self.expressions.append(expression)
             if self.eval_error:
                 raise self.eval_error
 
@@ -373,6 +375,178 @@ class SplitToggleTests(unittest.TestCase):
         self.assertFalse(state.split_eligible)
 
 
+class WorkspaceLayoutTests(unittest.TestCase):
+    class FakeLayoutStore:
+        def __init__(self, error=None):
+            self.saved = None
+            self.error = error
+
+        def save(self, workspace_id, layout):
+            if self.error:
+                raise self.error
+            self.saved = (workspace_id, layout)
+
+    @staticmethod
+    def horizontal():
+        return (
+            workspace(),
+            [client("0x1", 0, 0, 500, 800), client("0x2", 505, 0, 500, 800)],
+        )
+
+    @staticmethod
+    def scrolling():
+        return (workspace(tiledLayout="scrolling"), [])
+
+    def test_set_scrolling_uses_explicit_guard_and_persists_omarchy_rule(self):
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl(
+            [self.horizontal(), self.horizontal(), self.scrolling(), self.scrolling()]
+        )
+        layout_store = self.FakeLayoutStore()
+        with tempfile.TemporaryDirectory() as directory:
+            state = pane_ratio.set_workspace_layout(
+                fake,
+                pane_ratio.IntentStore(pathlib.Path(directory) / "state"),
+                layout_store,
+                "scrolling",
+            )
+        self.assertEqual(state.layout, "scrolling")
+        self.assertEqual(state.phase, "layout_scrolling")
+        self.assertEqual(layout_store.saved, (1, "scrolling"))
+        self.assertIn("workspace.id~=1", fake.expression)
+        self.assertIn('workspace.tiled_layout~="dwindle"', fake.expression)
+        self.assertIn('layout = "scrolling"', fake.expression)
+
+    def test_setting_current_layout_is_idempotent(self):
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl([self.horizontal()])
+        layout_store = self.FakeLayoutStore()
+        with tempfile.TemporaryDirectory() as directory:
+            state = pane_ratio.set_workspace_layout(
+                fake,
+                pane_ratio.IntentStore(pathlib.Path(directory) / "state"),
+                layout_store,
+                "dwindle",
+            )
+        self.assertEqual(state.phase, "layout_current")
+        self.assertEqual(fake.expressions, [])
+        self.assertEqual(layout_store.saved, (1, "dwindle"))
+
+    def test_set_dwindle_resumes_saved_ratio(self):
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl(
+            [
+                self.scrolling(),
+                self.scrolling(),
+                self.horizontal(),
+                self.horizontal(),
+                self.horizontal(),
+            ]
+        )
+        layout_store = self.FakeLayoutStore()
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set("1", "1:1")
+            state = pane_ratio.set_workspace_layout(fake, store, layout_store, "dwindle")
+        self.assertEqual(state.layout, "dwindle")
+        self.assertEqual(state.phase, "applied")
+        self.assertEqual(state.intent_ratio, "1:1")
+        self.assertEqual(layout_store.saved, (1, "dwindle"))
+
+    def test_persistence_failure_rolls_runtime_layout_back(self):
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl(
+            [self.horizontal(), self.horizontal(), self.scrolling(), self.horizontal()]
+        )
+        layout_store = self.FakeLayoutStore(pane_ratio.PaneRatioError("disk failure"))
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "runtime change was restored"):
+                pane_ratio.set_workspace_layout(
+                    fake,
+                    pane_ratio.IntentStore(pathlib.Path(directory) / "state"),
+                    layout_store,
+                    "scrolling",
+                )
+        self.assertEqual(len(fake.expressions), 2)
+        self.assertIn('layout = "dwindle"', fake.expressions[-1])
+
+    def test_post_replace_fsync_uncertainty_does_not_rollback_committed_rule(self):
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl(
+            [self.horizontal(), self.horizontal(), self.scrolling(), self.scrolling()]
+        )
+        layout_store = self.FakeLayoutStore(
+            pane_ratio.WorkspaceLayoutPersistenceError("fsync failed", committed=True)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = pane_ratio.set_workspace_layout(
+                fake,
+                pane_ratio.IntentStore(pathlib.Path(directory) / "state"),
+                layout_store,
+                "scrolling",
+            )
+        self.assertEqual(state.phase, "layout_scrolling")
+        self.assertIn("durability", state.message)
+        self.assertEqual(len(fake.expressions), 1)
+
+    def test_backend_toggle_uses_live_layout_instead_of_panel_cache(self):
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl(
+            [self.scrolling(), self.scrolling(), self.horizontal(), self.horizontal()]
+        )
+        layout_store = self.FakeLayoutStore()
+        with tempfile.TemporaryDirectory() as directory:
+            state = pane_ratio.set_workspace_layout(
+                fake,
+                pane_ratio.IntentStore(pathlib.Path(directory) / "state"),
+                layout_store,
+                "toggle",
+            )
+        self.assertEqual(state.layout, "dwindle")
+        self.assertEqual(layout_store.saved, (1, "dwindle"))
+        self.assertIn('workspace.tiled_layout~="scrolling"', fake.expressions[0])
+
+    def test_concurrent_native_change_persists_observed_layout(self):
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl(
+            [self.horizontal(), self.horizontal(), self.scrolling(), self.horizontal()]
+        )
+        layout_store = self.FakeLayoutStore()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "changed concurrently"):
+                pane_ratio.set_workspace_layout(
+                    fake,
+                    pane_ratio.IntentStore(pathlib.Path(directory) / "state"),
+                    layout_store,
+                    "scrolling",
+                )
+        self.assertEqual(layout_store.saved, (1, "dwindle"))
+
+    def test_workspace_change_skips_ratio_restore(self):
+        switched_workspace = (
+            workspace(id=2, name="2"),
+            [client("0x3", 0, 0, 1000, 800, workspace={"id": 2, "name": "2"})],
+        )
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl(
+            [self.scrolling(), self.scrolling(), self.horizontal(), switched_workspace]
+        )
+        layout_store = self.FakeLayoutStore()
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set("1", "1:1")
+            state = pane_ratio.set_workspace_layout(fake, store, layout_store, "dwindle")
+        self.assertEqual(state.workspace, 1)
+        self.assertEqual(state.phase, "layout_dwindle")
+        self.assertIn("will resume", state.message)
+        self.assertEqual(len(fake.expressions), 1)
+
+    def test_special_workspace_is_rejected_without_mutation(self):
+        snapshot = (workspace(id=-99, name="special:scratch"), [])
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl([snapshot])
+        with tempfile.TemporaryDirectory() as directory:
+            state = pane_ratio.set_workspace_layout(
+                fake,
+                pane_ratio.IntentStore(pathlib.Path(directory) / "state"),
+                self.FakeLayoutStore(),
+                "scrolling",
+            )
+        self.assertEqual(state.phase, "paused_mode")
+        self.assertEqual(fake.expressions, [])
+
+
 class IntentStoreTests(unittest.TestCase):
     def test_round_trip_and_clear_use_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -382,6 +556,29 @@ class IntentStoreTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(store.path.stat().st_mode), 0o600)
             store.clear("1")
             self.assertEqual(store.load(), {})
+
+    def test_workspace_layout_store_writes_omarchy_compatible_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory) / "workspace-layouts"
+            store = pane_ratio.WorkspaceLayoutStore(state)
+            store.save(7, "scrolling")
+            rule = state / "7.lua"
+            self.assertEqual(
+                rule.read_text(),
+                'hl.workspace_rule({ workspace = "7", layout = "scrolling" })\n',
+            )
+            self.assertEqual(stat.S_IMODE(rule.stat().st_mode), 0o600)
+
+    def test_workspace_layout_store_rejects_existing_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory) / "workspace-layouts"
+            state.mkdir()
+            target = pathlib.Path(directory) / "target"
+            target.write_text("unchanged")
+            (state / "1.lua").symlink_to(target)
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "regular file"):
+                pane_ratio.WorkspaceLayoutStore(state).save(1, "dwindle")
+            self.assertEqual(target.read_text(), "unchanged")
 
     def test_symlink_intentions_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

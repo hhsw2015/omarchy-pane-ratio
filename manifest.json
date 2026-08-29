@@ -2,15 +2,15 @@
   "schemaVersion": 1,
   "id": "io.github.r404r.pane-ratio",
   "name": "Pane Ratio",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "r404r",
   "license": "MIT",
-  "description": "Save workspace ratios, auto-apply them, and switch a safe two-pane split.",
+  "description": "Control workspace layouts, save ratios, and switch a safe two-pane split.",
   "kinds": ["service", "bar-widget"],
   "entryPoints": { "service": "PaneRatioService.qml", "barWidget": "BarWidget.qml" },
   "barWidget": {
     "displayName": "Pane Ratio",
-    "description": "Save workspace ratios and switch a safe two-pane split",
+    "description": "Control Dwindle and Scrolling with safe workspace ratios",
     "category": "Desktop",
     "allowMultiple": false,
     "defaultSection": "right"

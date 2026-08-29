@@ -42,10 +42,23 @@ MAX_STATE_BYTES = 65536
 MAX_CONFIG_BYTES = 16384
 MAX_WORKSPACE_NAME_CHARS = 128
 STATE_SCHEMA_VERSION = 1
+WORKSPACE_LAYOUTS = ("dwindle", "scrolling")
 
 
 class PaneRatioError(RuntimeError):
     """Expected operational or validation failure."""
+
+
+class WorkspaceLayoutPersistenceError(PaneRatioError):
+    """Persistence failed, with whether atomic replacement already occurred."""
+
+    def __init__(self, message: str, *, committed: bool) -> None:
+        super().__init__(message)
+        self.committed = committed
+
+
+class ActiveWorkspaceChangedError(PaneRatioError):
+    """The user changed workspace during a guarded operation."""
 
 
 @dataclass(frozen=True)
@@ -74,6 +87,10 @@ class LayoutState:
             and self.active_address in self.addresses
         )
 
+    @property
+    def layout_eligible(self) -> bool:
+        return self.workspace >= 0 and self.layout in WORKSPACE_LAYOUTS
+
     def public(
         self, *, ok: bool = True, presets: dict[str, tuple[float, float]] | None = None
     ) -> dict[str, Any]:
@@ -89,6 +106,7 @@ class LayoutState:
             "intentRatio": self.intent_ratio,
             "state": self.phase,
             "splitEligible": self.split_eligible,
+            "layoutEligible": self.layout_eligible,
             "message": self.message,
         }
         if presets is not None:
@@ -415,6 +433,109 @@ class IntentStore:
             self.save(intentions)
 
 
+class WorkspaceLayoutStore:
+    """Safely persist rules consumed by Omarchy's workspace-layout loader."""
+
+    def __init__(self, state_dir: Path | None = None) -> None:
+        if state_dir is None:
+            override = os.environ.get("PANE_RATIO_LAYOUT_STATE_DIR")
+            if override:
+                state_dir = Path(override)
+            else:
+                xdg_state = os.environ.get("XDG_STATE_HOME")
+                base = Path(xdg_state) if xdg_state else Path.home() / ".local/state"
+                state_dir = base / "omarchy" / "workspace-layouts"
+        self.directory = state_dir
+
+    def _open_directory(self) -> int:
+        if not self.directory.is_absolute():
+            raise PaneRatioError("workspace layout state directory must be absolute")
+        try:
+            current = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            for component in self.directory.parts[1:]:
+                if component in ("", ".", ".."):
+                    raise PaneRatioError("workspace layout state directory is invalid")
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
+                following = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=current,
+                )
+                os.close(current)
+                current = following
+            os.fchmod(current, 0o700)
+            return current
+        except PaneRatioError:
+            try:
+                os.close(current)
+            except (OSError, UnboundLocalError):
+                pass
+            raise
+        except OSError as error:
+            try:
+                os.close(current)
+            except (OSError, UnboundLocalError):
+                pass
+            raise PaneRatioError("could not prepare workspace layout state") from error
+
+    def save(self, workspace_id: int, layout: str) -> None:
+        if workspace_id < 0 or layout not in WORKSPACE_LAYOUTS:
+            raise PaneRatioError("invalid workspace layout rule")
+        filename = f"{workspace_id}.lua"
+        encoded = (
+            f'hl.workspace_rule({{ workspace = "{workspace_id}", layout = "{layout}" }})\n'
+        ).encode()
+        directory_fd = self._open_directory()
+        temporary: str | None = None
+        replaced = False
+        try:
+            for attempt in range(32):
+                candidate = f".{workspace_id}.{os.getpid()}.{time.monotonic_ns()}.{attempt}"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    temporary = candidate
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise PaneRatioError("could not create a temporary workspace layout rule")
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                existing = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                    raise PaneRatioError("workspace layout rule path is not a regular file")
+            except FileNotFoundError:
+                pass
+            os.replace(temporary, filename, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            temporary = None
+            replaced = True
+            os.fsync(directory_fd)
+        except PaneRatioError:
+            raise
+        except OSError as error:
+            raise WorkspaceLayoutPersistenceError(
+                "could not persist workspace layout", committed=replaced
+            ) from error
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(directory_fd)
+
+
 def _kill_process(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -697,11 +818,16 @@ def apply_ratio(
     hyprctl: Hyprctl,
     ratio: str,
     presets: dict[str, tuple[float, float]] = PRESETS,
+    expected_workspace: int | None = None,
 ) -> LayoutState:
     if ratio not in presets:
         raise PaneRatioError("unsupported ratio preset")
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
     first = read_state(hyprctl, deadline=deadline, presets=presets)
+    if expected_workspace is not None and first.workspace != expected_workspace:
+        raise ActiveWorkspaceChangedError(
+            "active workspace changed before the ratio could be applied"
+        )
     if not first.eligible:
         return first
     second = read_state(hyprctl, deadline=deadline, presets=presets)
@@ -811,8 +937,16 @@ def status_with_intent(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     return classify_with_intent(state, intention)
 
 
-def reconcile(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
+def reconcile(
+    hyprctl: Hyprctl,
+    store: IntentStore,
+    expected_workspace: int | None = None,
+) -> LayoutState:
     state = read_state(hyprctl, presets=store.presets)
+    if expected_workspace is not None and state.workspace != expected_workspace:
+        raise ActiveWorkspaceChangedError(
+            "active workspace changed before its ratio could be restored"
+        )
     intention = store.load().get(state.workspace_name, "")
     if not intention:
         return state.with_intent("", "no_intent", "No saved ratio for this workspace.")
@@ -825,7 +959,12 @@ def reconcile(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     classified = classify_with_intent(state, intention)
     if classified.phase != "eligible":
         return classified
-    return apply_ratio(hyprctl, intention, store.presets)
+    return apply_ratio(
+        hyprctl,
+        intention,
+        store.presets,
+        expected_workspace=state.workspace,
+    )
 
 
 def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
@@ -911,7 +1050,7 @@ def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
 
     intention = store.load().get(verified.workspace_name, "")
     if verified.orientation == "horizontal" and intention in store.presets:
-        applied = reconcile(hyprctl, store)
+        applied = reconcile(hyprctl, store, expected_workspace=verified.workspace)
         return applied.with_intent(
             intention,
             applied.phase,
@@ -926,6 +1065,141 @@ def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     )
 
 
+def set_workspace_layout(
+    hyprctl: Hyprctl,
+    store: IntentStore,
+    layout_store: WorkspaceLayoutStore,
+    target: str,
+) -> LayoutState:
+    if target not in (*WORKSPACE_LAYOUTS, "toggle"):
+        raise PaneRatioError("unsupported workspace layout")
+    deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
+    first = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    intention = store.load().get(first.workspace_name, "")
+    if not first.layout_eligible:
+        return first.with_intent(
+            intention,
+            "paused_mode",
+            "Workspace layout switching supports regular Dwindle and Scrolling workspaces only.",
+        )
+    if target == "toggle":
+        target = "scrolling" if first.layout == "dwindle" else "dwindle"
+    if first.layout == target:
+        warning = ""
+        try:
+            layout_store.save(first.workspace, target)
+        except WorkspaceLayoutPersistenceError as error:
+            if not error.committed:
+                raise
+            warning = " Rule replacement completed, but disk durability could not be confirmed."
+        return classify_with_intent(first, intention).with_intent(
+            intention,
+            "layout_current",
+            f"Workspace already uses {target.title()}." + warning,
+        )
+
+    second = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if (second.workspace, second.layout) != (first.workspace, first.layout):
+        raise PaneRatioError("workspace layout changed while switching; try again")
+    expression = (
+        "local workspace=hl.get_active_workspace();"
+        f'if workspace==nil or workspace.id~={second.workspace} '
+        f'or workspace.tiled_layout~="{second.layout}" then '
+        'error("Pane Ratio workspace changed") end;'
+        f'hl.workspace_rule({{ workspace = "{second.workspace}", layout = "{target}" }})'
+    )
+    hyprctl.eval(expression, deadline=deadline)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PaneRatioError("Pane Ratio operation timed out")
+    time.sleep(min(0.08, remaining))
+    verified = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if verified.workspace != first.workspace or verified.layout != target:
+        raise PaneRatioError("Hyprland did not apply the requested workspace layout")
+
+    durability_warning = ""
+    error_to_rollback: PaneRatioError | None = None
+    try:
+        layout_store.save(verified.workspace, target)
+    except WorkspaceLayoutPersistenceError as error:
+        if error.committed:
+            durability_warning = (
+                " Rule replacement completed, but disk durability could not be confirmed."
+            )
+        else:
+            error_to_rollback = error
+    except PaneRatioError as error:
+        error_to_rollback = error
+
+    if error_to_rollback is not None:
+        rollback = (
+            "local workspace=hl.get_active_workspace();"
+            f'if workspace==nil or workspace.id~={verified.workspace} '
+            f'or workspace.tiled_layout~="{target}" then '
+            'error("Pane Ratio workspace changed") end;'
+            f'hl.workspace_rule({{ workspace = "{verified.workspace}", layout = "{first.layout}" }})'
+        )
+        try:
+            hyprctl.eval(rollback, deadline=deadline)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PaneRatioError("Pane Ratio operation timed out")
+            time.sleep(min(0.08, remaining))
+            restored = read_state(hyprctl, deadline=deadline, presets=store.presets)
+            if restored.workspace != first.workspace or restored.layout != first.layout:
+                raise PaneRatioError("Hyprland did not confirm the rollback")
+        except PaneRatioError as rollback_error:
+            raise PaneRatioError(
+                "workspace layout changed but persistence and automatic rollback failed"
+            ) from rollback_error
+        raise PaneRatioError(
+            "could not persist workspace layout; the runtime change was restored"
+        ) from error_to_rollback
+
+    final_state = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if final_state.workspace == verified.workspace:
+        if final_state.layout != target:
+            layout_store.save(final_state.workspace, final_state.layout)
+            raise PaneRatioError(
+                "workspace layout changed concurrently; the observed layout was persisted"
+            )
+        verified = final_state
+
+    if target == "dwindle" and intention in store.presets:
+        if final_state.workspace != verified.workspace:
+            return verified.with_intent(
+                intention,
+                "layout_dwindle",
+                "Switched workspace to Dwindle. Saved ratio will resume when the workspace is active."
+                + durability_warning,
+            )
+        try:
+            applied = reconcile(
+                hyprctl,
+                store,
+                expected_workspace=verified.workspace,
+            )
+        except ActiveWorkspaceChangedError:
+            return verified.with_intent(
+                intention,
+                "layout_dwindle",
+                "Switched workspace to Dwindle. Saved ratio will resume when the workspace is active."
+                + durability_warning,
+            )
+        return applied.with_intent(
+            intention,
+            "layout_dwindle" if applied.phase != "applied" else "applied",
+            f"Switched workspace to Dwindle. {applied.message}" + durability_warning,
+        )
+    return verified.with_intent(
+        intention,
+        f"layout_{target}",
+        f"Switched workspace to {target.title()}."
+        + (f" Saved ratio {intention} is paused." if intention else "")
+        + durability_warning,
+    )
+
+
 def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
 
@@ -935,6 +1209,7 @@ def execute(
     hyprctl: Hyprctl,
     store: IntentStore,
     presets: dict[str, tuple[float, float]],
+    layout_store: WorkspaceLayoutStore | None = None,
 ) -> int:
     if arguments == ["status"]:
         state = status_with_intent(hyprctl, store)
@@ -947,6 +1222,32 @@ def execute(
     if arguments == ["split", "toggle"]:
         state = toggle_split(hyprctl, store)
         success = state.phase in ("split_vertical", "split_horizontal", "applied")
+        emit(state.public(ok=success, presets=presets))
+        return 0 if success else 2
+    if len(arguments) == 3 and arguments[:2] == ["layout", "set"]:
+        target = arguments[2]
+        state = set_workspace_layout(
+            hyprctl,
+            store,
+            layout_store or WorkspaceLayoutStore(),
+            target,
+        )
+        success = state.phase in (
+            "layout_current",
+            "layout_dwindle",
+            "layout_scrolling",
+            "applied",
+        )
+        emit(state.public(ok=success, presets=presets))
+        return 0 if success else 2
+    if arguments == ["layout", "toggle"]:
+        state = set_workspace_layout(
+            hyprctl,
+            store,
+            layout_store or WorkspaceLayoutStore(),
+            "toggle",
+        )
+        success = state.phase in ("layout_dwindle", "layout_scrolling", "applied")
         emit(state.public(ok=success, presets=presets))
         return 0 if success else 2
     if len(arguments) == 3 and arguments[:2] == ["intent", "set"]:
@@ -969,7 +1270,7 @@ def execute(
         emit(state.public(ok=state.eligible, presets=presets))
         return 0 if state.eligible else 2
     raise PaneRatioError(
-        "usage: pane-ratio status | reconcile | intent set PRESET | intent clear | split toggle"
+        "usage: pane-ratio status | reconcile | intent set PRESET | intent clear | split toggle | layout set dwindle|scrolling | layout toggle"
     )
 
 
@@ -978,8 +1279,9 @@ def main(arguments: list[str]) -> int:
         presets = load_presets()
         hyprctl = Hyprctl()
         store = IntentStore(presets=presets)
+        layout_store = WorkspaceLayoutStore()
         with store.locked():
-            return execute(arguments, hyprctl, store, presets)
+            return execute(arguments, hyprctl, store, presets, layout_store)
     except PaneRatioError as error:
         emit(
             {
