@@ -66,7 +66,7 @@ Use one to nine ratios. Each side must be an integer from 1 through 20. Ratios a
 ```bash
 python -m unittest discover -s tests -v
 omarchy plugin validate .
-qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml Service.qml
+qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml PaneRatioService.qml
 ```
 
 ## License

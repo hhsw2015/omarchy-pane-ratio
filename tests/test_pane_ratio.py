@@ -366,7 +366,7 @@ class IntentStoreTests(unittest.TestCase):
             thread.join()
 
     def test_service_listens_for_focus_recovery_events(self):
-        service = (SCRIPT.parents[1] / "Service.qml").read_text()
+        service = (SCRIPT.parents[1] / "PaneRatioService.qml").read_text()
         self.assertIn('"activewindow"', service)
         self.assertIn('"activewindowv2"', service)
 
