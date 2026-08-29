@@ -2,9 +2,14 @@
 
 import importlib.util
 import importlib.machinery
+import contextlib
+import io
+import json
 import pathlib
 import sys
+import time
 import unittest
+from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "bin" / "pane-ratio"
@@ -142,9 +147,11 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
         self.assertEqual(state.ratio, "2:1")
         self.assertIn('active.address~="0x1"', fake.expression)
         self.assertIn("workspace.id~=1", fake.expression)
+        self.assertIn('workspace.tiled_layout~="dwindle"', fake.expression)
         self.assertIn('["0x1"]=true', fake.expression)
         self.assertIn('["0x2"]=true', fake.expression)
         self.assertIn("count~=2", fake.expression)
+        self.assertIn("window.fullscreen~=0", fake.expression)
 
     def test_atomic_guard_failure_is_propagated_without_verification(self):
         initial = self.snapshot(500, 500)
@@ -156,6 +163,35 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
             pane_ratio.apply_ratio(fake, "1:1")
 
         self.assertEqual(fake.call_index, 6)
+
+    def test_expired_operation_deadline_does_not_spawn_process(self):
+        with mock.patch.object(pane_ratio.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "timed out"):
+                pane_ratio.bounded_command(
+                    ["/usr/bin/false"], 64, operation_deadline=time.monotonic() - 1
+                )
+        popen.assert_not_called()
+
+    def test_process_start_failure_uses_operational_error(self):
+        with mock.patch.object(
+            pane_ratio.subprocess, "Popen", side_effect=OSError("unavailable")
+        ):
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "could not start"):
+                pane_ratio.bounded_command(["/usr/bin/false"], 64)
+
+    def test_main_unexpected_failure_preserves_json_contract(self):
+        output = io.StringIO()
+        with mock.patch.object(pane_ratio, "Hyprctl", side_effect=RuntimeError("boom")):
+            with contextlib.redirect_stdout(output):
+                exit_code = pane_ratio.main(["status"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["eligible"])
+        self.assertEqual(
+            payload["message"], "Pane Ratio encountered an unexpected internal error."
+        )
 
     def test_scrolling_is_rejected(self):
         state = pane_ratio.analyze(workspace(tiledLayout="scrolling"), [], SPLIT_BIAS)

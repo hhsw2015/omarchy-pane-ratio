@@ -73,6 +73,8 @@ def _kill_process(process: subprocess.Popen[bytes]) -> None:
 def bounded_command(
     arguments: list[str], maximum_bytes: int, operation_deadline: float | None = None
 ) -> bytes:
+    if operation_deadline is not None and time.monotonic() >= operation_deadline:
+        raise PaneRatioError("Pane Ratio operation timed out")
     try:
         process = subprocess.Popen(
             arguments,
@@ -323,16 +325,21 @@ def apply_ratio(hyprctl: Hyprctl, ratio: str) -> LayoutState:
         "local active=hl.get_active_window();"
         "local workspace=hl.get_active_workspace();"
         f'if active==nil or workspace==nil or active.address~="{second.active_address}" '
-        f"or workspace.id~={second.workspace} then error(\"Pane Ratio target changed\") end;"
+        f'or workspace.id~={second.workspace} or workspace.tiled_layout~="dwindle" '
+        "then error(\"Pane Ratio target changed\") end;"
         f"local expected={{{expected_addresses}}};local count=0;"
         "for _,window in ipairs(hl.get_workspace_windows(workspace)) do "
         "if window.mapped and not window.floating then count=count+1;"
+        "if window.fullscreen~=0 then error(\"Pane Ratio fullscreen changed\") end;"
         "if not expected[window.address] then error(\"Pane Ratio windows changed\") end end end;"
         "if count~=2 then error(\"Pane Ratio windows changed\") end;"
         f'hl.dispatch(hl.dsp.layout("splitratio {exact:.6f} exact"))'
     )
     hyprctl.eval(expression, deadline=deadline)
-    time.sleep(0.08)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PaneRatioError("Pane Ratio operation timed out")
+    time.sleep(min(0.08, remaining))
     verified = read_state(hyprctl, deadline=deadline)
     if not verified.eligible or verified.workspace != first.workspace or verified.addresses != first.addresses:
         raise PaneRatioError("workspace windows changed before the ratio could be verified")

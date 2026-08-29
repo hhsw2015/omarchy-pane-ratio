@@ -35,6 +35,7 @@ Panel {
     + "/.config/omarchy/plugins/io.github.r404r.pane-ratio/bin/pane-ratio"
   readonly property bool busy: statusProcess.running || applyProcess.running
     || root.statusFinishing || root.applyFinishing
+  readonly property bool applying: applyProcess.running || root.applyFinishing
   readonly property bool eligible: errorText === "" && layoutName === "dwindle"
     && tiledWindows === 2 && orientation === "horizontal"
   readonly property color foreground: Color.popups.text
@@ -94,6 +95,7 @@ Panel {
   function applyRatio(ratio) {
     if (root.busy || !root.eligible || root.presets.indexOf(ratio) < 0) return
     root.errorText = ""
+    root.statusText = "Applying " + ratio + "…"
     root.pendingRatio = ratio
     root.resetOutput(true)
     applyProcess.running = true
@@ -119,7 +121,10 @@ Panel {
         return false
       }
       root.errorText = ""
-      root.statusText = "Workspace " + root.workspaceId + " · Dwindle · 2 tiled windows"
+      root.statusText = applying
+        ? "Applied " + String(state.ratio || requestedRatio) + " · Workspace "
+          + root.workspaceId + " · Dwindle"
+        : "Workspace " + root.workspaceId + " · Dwindle · 2 tiled windows"
       if (applying) root.currentRatio = String(state.ratio || requestedRatio)
       return true
     } catch (error) {
@@ -130,6 +135,10 @@ Panel {
   }
 
   function moveFocus(delta) {
+    if (!root.eligible || root.busy) {
+      root.focusIndex = 0
+      return
+    }
     root.focusIndex = (root.focusIndex + (delta > 0 ? 1 : -1) + root.focusTargetCount)
       % root.focusTargetCount
   }
@@ -244,7 +253,7 @@ Panel {
           Button {
             id: refreshButton
             width: Style.space(82)
-            text: root.busy ? "Checking…" : "Refresh"
+            text: root.applying ? "Applying…" : (root.busy ? "Checking…" : "Refresh")
             tooltipText: "Refresh workspace state (R)"
             bordered: false
             focusable: true
@@ -298,13 +307,15 @@ Panel {
               Accessible.role: Accessible.Button
               Accessible.name: modelData + " left to right, " + root.presetHints[index]
               Accessible.description: selected ? "Current ratio" : "Apply ratio"
+              Accessible.onPressAction: root.applyRatio(modelData)
 
               Column {
                 anchors.centerIn: parent
                 spacing: Style.space(6)
 
                 Rectangle {
-                  width: Style.space(64)
+                  width: Math.max(Style.space(38),
+                    Math.min(Style.space(64), presetCard.width - Style.space(16)))
                   height: Style.space(24)
                   radius: Math.max(3, Style.cornerRadius - 1)
                   color: "transparent"
@@ -340,12 +351,15 @@ Panel {
 
                 Text {
                   anchors.horizontalCenter: parent.horizontalCenter
+                  width: presetCard.width - Style.space(12)
                   text: presetCard.modelData + "  ·  " + root.presetHints[presetCard.index]
                   textFormat: Text.PlainText
                   color: presetCard.selected ? root.accent : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: presetCard.selected
+                  horizontalAlignment: Text.AlignHCenter
+                  elide: Text.ElideRight
                 }
               }
 
