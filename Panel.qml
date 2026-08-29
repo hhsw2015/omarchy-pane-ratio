@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -17,6 +18,8 @@ Panel {
   property string layoutName: "unknown"
   property string orientation: "unknown"
   property string currentRatio: ""
+  property string intentRatio: ""
+  property string intentState: "no_intent"
   property string errorText: ""
   property string statusText: "Checking current workspace…"
   property string statusOutput: ""
@@ -25,16 +28,17 @@ Panel {
   property bool applyOutputOverflow: false
   property bool statusFinishing: false
   property bool applyFinishing: false
+  property bool clearFinishing: false
+  property bool refreshPending: false
   property string pendingRatio: ""
 
-  readonly property var presets: ["1:2", "1:1", "2:1"]
-  readonly property var presetShares: [1 / 3, 1 / 2, 2 / 3]
-  readonly property var presetHints: ["Right focus", "Balanced", "Left focus"]
+  property var presets: ["1:3", "1:2", "1:1", "2:1", "3:1"]
+  property var presetShares: [1 / 4, 1 / 3, 1 / 2, 2 / 3, 3 / 4]
   readonly property int maxOutputChars: 16384
   readonly property string cliPath: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/io.github.r404r.pane-ratio/bin/pane-ratio"
-  readonly property bool busy: statusProcess.running || applyProcess.running
-    || root.statusFinishing || root.applyFinishing
+  readonly property bool busy: statusProcess.running || applyProcess.running || clearProcess.running
+    || root.statusFinishing || root.applyFinishing || root.clearFinishing
   readonly property bool applying: applyProcess.running || root.applyFinishing
   readonly property bool eligible: errorText === "" && layoutName === "dwindle"
     && tiledWindows === 2 && orientation === "horizontal"
@@ -42,7 +46,14 @@ Panel {
   readonly property color mutedForeground: Qt.darker(foreground, 1.45)
   readonly property color accent: Color.accent
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-  readonly property int focusTargetCount: 4
+  readonly property int focusTargetCount: root.presets.length + 1
+    + (root.intentRatio === "" ? 0 : 1)
+  readonly property var relevantEvents: [
+    "openwindow", "closewindow", "movewindow", "movewindowv2",
+    "changefloatingmode", "fullscreen", "activewindow", "activewindowv2",
+    "workspace", "workspacev2", "focusedmon", "focusedmonv2",
+    "togglegroup", "moveintogroup", "moveoutofgroup", "configreloaded"
+  ]
 
   function open() {
     root.controller.show()
@@ -85,7 +96,11 @@ Panel {
   }
 
   function refresh() {
-    if (root.busy) return
+    if (root.busy) {
+      root.refreshPending = true
+      return
+    }
+    root.refreshPending = false
     root.errorText = ""
     root.statusText = "Checking current workspace…"
     root.resetOutput(false)
@@ -93,12 +108,20 @@ Panel {
   }
 
   function applyRatio(ratio) {
-    if (root.busy || !root.eligible || root.presets.indexOf(ratio) < 0) return
+    if (root.busy || root.presets.indexOf(ratio) < 0) return
     root.errorText = ""
     root.statusText = "Applying " + ratio + "…"
     root.pendingRatio = ratio
     root.resetOutput(true)
     applyProcess.running = true
+  }
+
+  function clearIntent() {
+    if (root.busy || root.intentRatio === "") return
+    root.errorText = ""
+    root.statusText = "Removing saved ratio…"
+    root.resetOutput(true)
+    clearProcess.running = true
   }
 
   function consumeResult(output, overflow, exitCode, applying, requestedRatio) {
@@ -115,17 +138,28 @@ Panel {
       root.tiledWindows = Number(state.tiledWindows || 0)
       root.orientation = String(state.orientation || "unknown")
       root.currentRatio = String(state.ratio || "")
-      if (exitCode !== 0 || state.ok !== true || state.eligible !== true) {
+      root.intentRatio = String(state.intentRatio || "")
+      root.intentState = String(state.state || "unknown")
+      if (Array.isArray(state.presets) && state.presets.length > 0) {
+        var labels = []
+        var shares = []
+        for (var index = 0; index < state.presets.length; index++) {
+          labels.push(String(state.presets[index].label || ""))
+          shares.push(Number(state.presets[index].leftShare || 0.5))
+        }
+        root.presets = labels
+        root.presetShares = shares
+        root.focusIndex = Math.min(root.focusIndex, root.focusTargetCount - 1)
+      }
+      if (exitCode !== 0 || state.ok !== true) {
         root.errorText = String(state.message || "The current workspace cannot be adjusted.")
         root.statusText = "Workspace " + root.workspaceId + " · " + root.layoutName
         return false
       }
       root.errorText = ""
-      root.statusText = applying
-        ? "Applied " + String(state.ratio || requestedRatio) + " · Workspace "
-          + root.workspaceId + " · Dwindle"
-        : "Workspace " + root.workspaceId + " · Dwindle · 2 tiled windows"
-      if (applying) root.currentRatio = String(state.ratio || requestedRatio)
+      root.statusText = String(state.message || ("Workspace " + root.workspaceId))
+      if (applying && root.intentState === "applied")
+        root.currentRatio = String(state.ratio || requestedRatio)
       return true
     } catch (error) {
       root.errorText = "Could not read Pane Ratio status."
@@ -135,7 +169,7 @@ Panel {
   }
 
   function moveFocus(delta) {
-    if (!root.eligible || root.busy) {
+    if (root.busy) {
       root.focusIndex = 0
       return
     }
@@ -145,12 +179,14 @@ Panel {
 
   function activateFocused() {
     if (root.focusIndex === 0) root.refresh()
-    else root.applyRatio(root.presets[root.focusIndex - 1])
+    else if (root.focusIndex <= root.presets.length)
+      root.applyRatio(root.presets[root.focusIndex - 1])
+    else root.clearIntent()
   }
 
   Process {
     id: statusProcess
-    command: [root.cliPath, "status"]
+    command: [root.cliPath, "reconcile"]
     stdout: SplitParser {
       splitMarker: ""
       onRead: function(chunk) { root.appendOutput(chunk, false) }
@@ -161,13 +197,30 @@ Panel {
       Qt.callLater(function() {
         root.consumeResult(root.statusOutput, root.statusOutputOverflow, exitCode, false, "")
         root.statusFinishing = false
+        if (root.refreshPending) Qt.callLater(root.refresh)
       })
     }
   }
 
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      var name = String(event && event.name ? event.name : "")
+      if (root.opened && root.relevantEvents.indexOf(name) >= 0)
+        panelRefreshDebounce.restart()
+    }
+  }
+
+  Timer {
+    id: panelRefreshDebounce
+    interval: 220
+    repeat: false
+    onTriggered: root.refresh()
+  }
+
   Process {
     id: applyProcess
-    command: [root.cliPath, "apply", root.pendingRatio]
+    command: [root.cliPath, "intent", "set", root.pendingRatio]
     stdout: SplitParser {
       splitMarker: ""
       onRead: function(chunk) { root.appendOutput(chunk, true) }
@@ -179,6 +232,25 @@ Panel {
       Qt.callLater(function() {
         root.consumeResult(root.applyOutput, root.applyOutputOverflow, exitCode, true, completedRatio)
         root.applyFinishing = false
+        if (root.refreshPending) Qt.callLater(root.refresh)
+      })
+    }
+  }
+
+  Process {
+    id: clearProcess
+    command: [root.cliPath, "intent", "clear"]
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) { root.appendOutput(chunk, true) }
+    }
+    stderr: SplitParser { splitMarker: ""; onRead: function(chunk) {} }
+    onExited: function(exitCode) {
+      root.clearFinishing = true
+      Qt.callLater(function() {
+        root.consumeResult(root.applyOutput, root.applyOutputOverflow, exitCode, true, "")
+        root.clearFinishing = false
+        if (root.refreshPending) Qt.callLater(root.refresh)
       })
     }
   }
@@ -205,9 +277,11 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
         if (text === "r" || text === "R") root.refresh()
-        else if (text === "1") root.applyRatio("1:2")
-        else if (text === "2") root.applyRatio("1:1")
-        else if (text === "3") root.applyRatio("2:1")
+        else if (/^[1-9]$/.test(text)) {
+          var index = Number(text) - 1
+          if (index < root.presets.length) root.applyRatio(root.presets[index])
+        }
+        else if (text === "d" || text === "D") root.clearIntent()
       }
 
       Column {
@@ -281,8 +355,9 @@ Panel {
           font.bold: true
         }
 
-        Row {
+        Grid {
           width: parent.width
+          columns: 3
           spacing: Style.space(8)
 
           Repeater {
@@ -292,9 +367,9 @@ Panel {
               id: presetCard
               required property string modelData
               required property int index
-              readonly property bool selected: root.currentRatio === modelData
+              readonly property bool selected: root.intentRatio === modelData
               readonly property bool focused: root.focusIndex === index + 1
-              readonly property bool available: root.eligible && !root.busy
+              readonly property bool available: !root.busy
               width: (content.width - Style.space(16)) / 3
               height: Style.space(78)
               radius: Math.max(4, Style.cornerRadius)
@@ -305,8 +380,8 @@ Panel {
               border.color: selected ? root.accent : Util.alpha(root.foreground, 0.42)
               opacity: available ? 1 : 0.48
               Accessible.role: Accessible.Button
-              Accessible.name: modelData + " left to right, " + root.presetHints[index]
-              Accessible.description: selected ? "Current ratio" : "Apply ratio"
+              Accessible.name: modelData + " left to right"
+              Accessible.description: selected ? "Saved workspace rule" : "Save workspace rule"
               Accessible.onPressAction: root.applyRatio(modelData)
 
               Column {
@@ -352,7 +427,7 @@ Panel {
                 Text {
                   anchors.horizontalCenter: parent.horizontalCenter
                   width: presetCard.width - Style.space(12)
-                  text: presetCard.modelData + "  ·  " + root.presetHints[presetCard.index]
+                  text: presetCard.modelData
                   textFormat: Text.PlainText
                   color: presetCard.selected ? root.accent : root.foreground
                   font.family: root.fontFamily
@@ -385,6 +460,20 @@ Panel {
           }
         }
 
+        Button {
+          width: parent.width
+          text: root.intentRatio === "" ? "No saved workspace rule" : "Forget " + root.intentRatio + " for this workspace"
+          tooltipText: "Remove saved ratio (D)"
+          bordered: true
+          focusable: true
+          hasCursor: root.focusIndex === root.presets.length + 1
+          enabled: !root.busy && root.intentRatio !== ""
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.clearIntent()
+          onHovered: function(hovered) { if (hovered) root.focusIndex = root.presets.length + 1 }
+        }
+
         Text {
           visible: root.errorText !== ""
           width: parent.width
@@ -399,9 +488,8 @@ Panel {
         Text {
           visible: root.errorText === ""
           width: parent.width
-          text: root.currentRatio === "Custom"
-            ? "Current ratio: Custom"
-            : "Current ratio: " + (root.currentRatio || "Unknown")
+          text: "Saved: " + (root.intentRatio || "None")
+            + "   ·   Current: " + (root.currentRatio || "Unavailable")
           textFormat: Text.PlainText
           color: root.mutedForeground
           font.family: root.fontFamily
@@ -410,7 +498,8 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Keys  1  2  3  choose a ratio   ·   R  refreshes"
+          text: "Keys 1–" + root.presets.length + " choose ratios"
+            + (root.intentRatio === "" ? "" : " · D forget") + " · R refresh"
           color: root.mutedForeground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

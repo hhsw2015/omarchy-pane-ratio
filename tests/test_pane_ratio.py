@@ -5,8 +5,12 @@ import importlib.machinery
 import contextlib
 import io
 import json
+import os
 import pathlib
+import stat
 import sys
+import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -24,6 +28,7 @@ SPEC.loader.exec_module(pane_ratio)
 def workspace(**changes):
     value = {
         "id": 1,
+        "name": "1",
         "tiledLayout": "dwindle",
         "lastwindow": "0x1",
         "hasfullscreen": False,
@@ -93,7 +98,7 @@ class AnalyzeTests(unittest.TestCase):
             SPLIT_BIAS,
         )
         self.assertFalse(state.eligible)
-        self.assertIn("found 3", state.message)
+        self.assertIn("3 tiled windows", state.message)
 
     def test_vertical_pair_is_rejected(self):
         state = pane_ratio.analyze(
@@ -150,8 +155,11 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
         self.assertIn('workspace.tiled_layout~="dwindle"', fake.expression)
         self.assertIn('["0x1"]=true', fake.expression)
         self.assertIn('["0x2"]=true', fake.expression)
-        self.assertIn("count~=2", fake.expression)
+        self.assertIn("#windows~=2", fake.expression)
         self.assertIn("window.fullscreen~=0", fake.expression)
+        self.assertIn('hl.get_config("dwindle.split_bias")', fake.expression)
+        self.assertIn("window.group~=nil", fake.expression)
+        self.assertIn("left.at.x<right.at.x", fake.expression)
 
     def test_atomic_guard_failure_is_propagated_without_verification(self):
         initial = self.snapshot(500, 500)
@@ -160,8 +168,18 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(pane_ratio.PaneRatioError, "target changed"):
-            pane_ratio.apply_ratio(fake, "1:1")
+            pane_ratio.apply_ratio(fake, "2:1")
 
+        self.assertEqual(fake.call_index, 6)
+
+    def test_already_applied_ratio_is_idempotent(self):
+        initial = self.snapshot(1000, 500)
+        fake = self.FakeHyprctl([initial, initial])
+
+        state = pane_ratio.apply_ratio(fake, "2:1")
+
+        self.assertEqual(state.phase, "applied")
+        self.assertEqual(fake.expression, "")
         self.assertEqual(fake.call_index, 6)
 
     def test_expired_operation_deadline_does_not_spawn_process(self):
@@ -237,7 +255,7 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
         self.assertFalse(state.eligible)
         self.assertIn("Focus", state.message)
 
-    def test_pseudotiled_window_is_rejected(self):
+    def test_pseudo_flag_does_not_override_safe_geometry(self):
         state = pane_ratio.analyze(
             workspace(),
             [
@@ -246,8 +264,7 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
             ],
             SPLIT_BIAS,
         )
-        self.assertFalse(state.eligible)
-        self.assertIn("Pseudotiled", state.message)
+        self.assertTrue(state.eligible)
 
     def test_large_horizontal_gap_is_rejected(self):
         state = pane_ratio.analyze(
@@ -257,6 +274,160 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
         )
         self.assertFalse(state.eligible)
         self.assertEqual(state.orientation, "vertical")
+
+
+class IntentStoreTests(unittest.TestCase):
+    def test_round_trip_and_clear_use_private_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set("1", "3:1")
+            self.assertEqual(store.load(), {"1": "3:1"})
+            self.assertEqual(stat.S_IMODE(store.path.stat().st_mode), 0o600)
+            store.clear("1")
+            self.assertEqual(store.load(), {})
+
+    def test_symlink_intentions_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory) / "state"
+            state.mkdir()
+            target = pathlib.Path(directory) / "target"
+            target.write_text("{}")
+            (state / "intents.json").symlink_to(target)
+            store = pane_ratio.IntentStore(state)
+            with self.assertRaises(pane_ratio.PaneRatioError):
+                store.load()
+
+    def test_invalid_rule_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory) / "state"
+            state.mkdir()
+            (state / "intents.json").write_text(
+                '{"schemaVersion":1,"workspaces":{"1":{"enabled":true,"ratio":"99:1"}}}'
+            )
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "invalid rule"):
+                pane_ratio.IntentStore(state).load()
+
+    def test_custom_presets_are_reduced_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / "presets.json"
+            config.write_text('{"schemaVersion":1,"presets":["5:3","2:2","3:5"]}')
+            presets = pane_ratio.load_presets(config)
+            self.assertEqual(list(presets), ["5:3", "1:1", "3:5"])
+            self.assertAlmostEqual(presets["5:3"][1], 5 / 8)
+
+    def test_custom_preset_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "target.json"
+            target.write_text('{"schemaVersion":1,"presets":["1:1"]}')
+            link = pathlib.Path(directory) / "presets.json"
+            link.symlink_to(target)
+            with self.assertRaises(pane_ratio.PaneRatioError):
+                pane_ratio.load_presets(link)
+
+    def test_custom_preset_side_over_twenty_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / "presets.json"
+            config.write_text('{"schemaVersion":1,"presets":["21:1"]}')
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "between 1 and 20"):
+                pane_ratio.load_presets(config)
+
+    def test_fifo_preset_file_is_rejected_without_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = pathlib.Path(directory) / "presets.json"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "invalid"):
+                pane_ratio.load_presets(fifo)
+
+    def test_more_than_256_workspace_rules_are_rejected_on_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            rules = {str(index): "1:1" for index in range(257)}
+            with self.assertRaisesRegex(pane_ratio.PaneRatioError, "256"):
+                store.save(rules)
+
+    def test_operation_lock_serializes_independent_store_instances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory) / "state"
+            first = pane_ratio.IntentStore(state)
+            second = pane_ratio.IntentStore(state)
+            entered = threading.Event()
+            finished = threading.Event()
+
+            def contender():
+                with second.locked():
+                    entered.set()
+                finished.set()
+
+            with first.locked():
+                thread = threading.Thread(target=contender)
+                thread.start()
+                self.assertFalse(entered.wait(0.1))
+            self.assertTrue(finished.wait(1.0))
+            thread.join()
+
+    def test_service_listens_for_focus_recovery_events(self):
+        service = (SCRIPT.parents[1] / "Service.qml").read_text()
+        self.assertIn('"activewindow"', service)
+        self.assertIn('"activewindowv2"', service)
+
+
+class ReconcileTests(unittest.TestCase):
+    class StaticHyprctl:
+        def __init__(self, current_workspace, current_clients):
+            self.current_workspace = current_workspace
+            self.current_clients = current_clients
+
+        def json(self, maximum_bytes, *arguments, deadline=None):
+            if arguments == ("activeworkspace",):
+                return self.current_workspace
+            if arguments == ("clients",):
+                return self.current_clients
+            return SPLIT_BIAS
+
+    def test_one_window_waits_with_saved_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set("1", "2:1")
+            hyprctl = self.StaticHyprctl(workspace(), [client("0x1", 0, 0, 1000, 800)])
+            state = pane_ratio.reconcile(hyprctl, store)
+            self.assertEqual(state.phase, "waiting")
+            self.assertEqual(state.intent_ratio, "2:1")
+
+    def test_three_windows_pause_without_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set("1", "1:3")
+            clients = [
+                client("0x1", 0, 0, 500, 800),
+                client("0x2", 505, 0, 250, 800),
+                client("0x3", 760, 0, 250, 800),
+            ]
+            state = pane_ratio.reconcile(self.StaticHyprctl(workspace(), clients), store)
+            self.assertEqual(state.phase, "paused_topology")
+            self.assertEqual(state.intent_ratio, "1:3")
+
+    def test_fullscreen_pauses_instead_of_waiting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set("1", "2:1")
+            state = pane_ratio.reconcile(
+                self.StaticHyprctl(workspace(hasfullscreen=True), []), store
+            )
+            self.assertEqual(state.phase, "paused_mode")
+            self.assertIn("fullscreen", state.message)
+
+    def test_matching_geometry_is_reported_as_applied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set("1", "2:1")
+            clients = [
+                client("0x1", 0, 0, 1000, 800),
+                client("0x2", 1005, 0, 500, 800),
+            ]
+            state = pane_ratio.status_with_intent(
+                self.StaticHyprctl(workspace(), clients), store
+            )
+            self.assertEqual(state.phase, "applied")
 
 
 if __name__ == "__main__":
