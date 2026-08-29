@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.r404r.pane-ratio",
+  "name": "Pane Ratio",
+  "version": "0.1.0",
+  "author": "r404r",
+  "license": "MIT",
+  "description": "Apply precise ratio presets to two tiled Dwindle windows.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Pane Ratio",
+    "description": "Choose a ratio for two tiled windows",
+    "category": "Desktop",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

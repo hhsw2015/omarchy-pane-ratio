@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Safely apply ratio presets to exactly two horizontal Dwindle windows."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+
+PRESETS = {
+    "1:2": (0.666667, 1 / 3),
+    "1:1": (1.000000, 1 / 2),
+    "2:1": (1.333333, 2 / 3),
+}
+ADDRESS_RE = re.compile(r"0x[0-9A-Fa-f]+")
+MAX_WORKSPACE_BYTES = 65536
+MAX_CLIENTS_BYTES = 1048576
+MAX_OPTION_BYTES = 16384
+MAX_EVAL_BYTES = 65536
+MAX_CLIENTS = 4096
+COMMAND_TIMEOUT_SECONDS = 2.0
+APPLY_TIMEOUT_SECONDS = 5.0
+RATIO_TOLERANCE = 0.035
+
+
+class PaneRatioError(RuntimeError):
+    """Expected operational or validation failure."""
+
+
+@dataclass(frozen=True)
+class LayoutState:
+    workspace: int
+    layout: str
+    tiled_windows: int
+    orientation: str
+    ratio: str
+    left_share: float | None
+    addresses: tuple[str, ...]
+    active_address: str
+    eligible: bool
+    message: str
+
+    def public(self, *, ok: bool = True) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "eligible": self.eligible,
+            "workspace": self.workspace,
+            "layout": self.layout,
+            "tiledWindows": self.tiled_windows,
+            "orientation": self.orientation,
+            "ratio": self.ratio,
+            "message": self.message,
+        }
+
+
+def _kill_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def bounded_command(
+    arguments: list[str], maximum_bytes: int, operation_deadline: float | None = None
+) -> bytes:
+    try:
+        process = subprocess.Popen(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise PaneRatioError(f"could not start {arguments[0]}") from error
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    output = bytearray()
+    errors = bytearray()
+    deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
+    if operation_deadline is not None:
+        deadline = min(deadline, operation_deadline)
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_process(process)
+                raise PaneRatioError(f"{arguments[0]} timed out")
+            events = selector.select(remaining)
+            if not events:
+                continue
+            for key, _mask in events:
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                destination = output if key.data == "stdout" else errors
+                destination.extend(chunk)
+                if len(output) + len(errors) > maximum_bytes:
+                    _kill_process(process)
+                    raise PaneRatioError(f"{arguments[0]} returned too much data")
+        return_code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as error:
+        _kill_process(process)
+        raise PaneRatioError(f"{arguments[0]} timed out") from error
+    finally:
+        selector.close()
+
+    if return_code != 0:
+        detail = errors.decode("utf-8", "replace").strip().replace("\n", " ")[:240]
+        raise PaneRatioError(
+            f"{arguments[0]} failed with exit status {return_code}"
+            + (f": {detail}" if detail else "")
+        )
+    return bytes(output)
+
+
+class Hyprctl:
+    def __init__(self, executable: str | None = None) -> None:
+        self.executable = executable or shutil.which("hyprctl") or ""
+        if not self.executable or not os.path.isabs(self.executable):
+            raise PaneRatioError("hyprctl was not found")
+
+    def json(
+        self, maximum_bytes: int, *arguments: str, deadline: float | None = None
+    ) -> Any:
+        raw = bounded_command(
+            [self.executable, "-j", *arguments], maximum_bytes, deadline
+        )
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PaneRatioError("hyprctl returned invalid JSON") from error
+
+    def eval(self, expression: str, *, deadline: float | None = None) -> None:
+        bounded_command(
+            [self.executable, "eval", expression], MAX_EVAL_BYTES, deadline
+        )
+
+
+def _integer(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _pair(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    first, second = (_integer(value[0]), _integer(value[1]))
+    if first is None or second is None:
+        return None
+    return first, second
+
+
+def _ratio_label(left_share: float) -> str:
+    nearest = min(PRESETS.items(), key=lambda item: abs(item[1][1] - left_share))
+    return nearest[0] if abs(nearest[1][1] - left_share) <= RATIO_TOLERANCE else "Custom"
+
+
+def analyze(workspace: Any, clients: Any, split_bias: Any) -> LayoutState:
+    if not isinstance(workspace, dict):
+        raise PaneRatioError("active workspace has an unexpected shape")
+    workspace_id = _integer(workspace.get("id"))
+    if workspace_id is None:
+        raise PaneRatioError("active workspace has no numeric ID")
+    layout = workspace.get("tiledLayout")
+    layout = layout if isinstance(layout, str) else "unknown"
+    active_address = workspace.get("lastwindow")
+    active_address = active_address if isinstance(active_address, str) else ""
+
+    def unavailable(message: str, count: int = 0, orientation: str = "unknown") -> LayoutState:
+        return LayoutState(
+            workspace_id, layout, count, orientation, "", None, (), active_address, False, message
+        )
+
+    if workspace_id < 0:
+        return unavailable("Special workspaces are not supported.")
+    if layout != "dwindle":
+        return unavailable("Pane Ratio currently supports the Dwindle layout only.")
+    if workspace.get("hasfullscreen") is not False:
+        return unavailable("Exit fullscreen before changing the pane ratio.")
+    if not isinstance(split_bias, dict) or _integer(split_bias.get("int")) != 0:
+        return unavailable("The Dwindle split_bias option must be 0 (directional).")
+    if not isinstance(clients, list) or len(clients) > MAX_CLIENTS:
+        raise PaneRatioError("Hyprland returned an unexpected client list")
+
+    tiled: list[dict[str, Any]] = []
+    for client in clients:
+        if not isinstance(client, dict) or client.get("mapped") is not True:
+            continue
+        client_workspace = client.get("workspace")
+        if not isinstance(client_workspace, dict) or _integer(client_workspace.get("id")) != workspace_id:
+            continue
+        if client.get("floating") is not False:
+            continue
+        tiled.append(client)
+
+    if len(tiled) != 2:
+        return unavailable(
+            f"Pane Ratio needs exactly two tiled windows; found {len(tiled)}.", len(tiled)
+        )
+
+    addresses: list[str] = []
+    geometries: list[tuple[int, int, int, int, dict[str, Any]]] = []
+    for client in tiled:
+        address = client.get("address")
+        position = _pair(client.get("at"))
+        size = _pair(client.get("size"))
+        if not isinstance(address, str) or ADDRESS_RE.fullmatch(address) is None:
+            raise PaneRatioError("a tiled window has an invalid address")
+        if position is None or size is None or size[0] <= 0 or size[1] <= 0:
+            raise PaneRatioError("a tiled window has invalid geometry")
+        if client.get("fullscreen") not in (0, False):
+            return unavailable("Exit fullscreen before changing the pane ratio.", 2)
+        # Hyprland 0.56 omits this key for ordinary windows; reject only an
+        # explicit pseudotiled marker so normal clients remain compatible.
+        if client.get("pseudo") is True:
+            return unavailable("Pseudotiled windows are not supported.", 2)
+        grouped = client.get("grouped")
+        if not isinstance(grouped, list) or grouped:
+            return unavailable("Grouped windows are not supported.", 2)
+        addresses.append(address)
+        geometries.append((position[0], position[1], size[0], size[1], client))
+
+    geometries.sort(key=lambda geometry: geometry[0])
+    left, right = geometries
+    overlap = min(left[1] + left[3], right[1] + right[3]) - max(left[1], right[1])
+    horizontal = (
+        left[0] < right[0]
+        and abs((left[0] + left[2]) - right[0]) <= 16
+        and overlap >= min(left[3], right[3]) * 0.9
+    )
+    sorted_addresses = tuple(geometry[4]["address"] for geometry in geometries)
+    if not horizontal:
+        return LayoutState(
+            workspace_id,
+            layout,
+            2,
+            "vertical",
+            "",
+            None,
+            sorted_addresses,
+            active_address,
+            False,
+            "The two tiled windows must be arranged left and right.",
+        )
+    if active_address not in sorted_addresses:
+        return LayoutState(
+            workspace_id,
+            layout,
+            2,
+            "horizontal",
+            "",
+            None,
+            sorted_addresses,
+            active_address,
+            False,
+            "Focus one of the two tiled windows before applying a ratio.",
+        )
+
+    left_share = left[2] / (left[2] + right[2])
+    return LayoutState(
+        workspace_id,
+        layout,
+        2,
+        "horizontal",
+        _ratio_label(left_share),
+        left_share,
+        sorted_addresses,
+        active_address,
+        True,
+        "Ready.",
+    )
+
+
+def read_state(hyprctl: Hyprctl, *, deadline: float | None = None) -> LayoutState:
+    workspace = hyprctl.json(
+        MAX_WORKSPACE_BYTES, "activeworkspace", deadline=deadline
+    )
+    clients = hyprctl.json(MAX_CLIENTS_BYTES, "clients", deadline=deadline)
+    split_bias = hyprctl.json(
+        MAX_OPTION_BYTES, "getoption", "dwindle:split_bias", deadline=deadline
+    )
+    return analyze(workspace, clients, split_bias)
+
+
+def apply_ratio(hyprctl: Hyprctl, ratio: str) -> LayoutState:
+    if ratio not in PRESETS:
+        raise PaneRatioError("unsupported ratio preset")
+    deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
+    first = read_state(hyprctl, deadline=deadline)
+    if not first.eligible:
+        return first
+    second = read_state(hyprctl, deadline=deadline)
+    if not second.eligible or (
+        first.workspace,
+        first.addresses,
+        first.active_address,
+    ) != (
+        second.workspace,
+        second.addresses,
+        second.active_address,
+    ):
+        raise PaneRatioError("workspace windows changed while applying the ratio; try again")
+
+    exact, expected_share = PRESETS[ratio]
+    expected_addresses = ",".join(
+        f'["{address}"]=true' for address in second.addresses
+    )
+    expression = (
+        "local active=hl.get_active_window();"
+        "local workspace=hl.get_active_workspace();"
+        f'if active==nil or workspace==nil or active.address~="{second.active_address}" '
+        f"or workspace.id~={second.workspace} then error(\"Pane Ratio target changed\") end;"
+        f"local expected={{{expected_addresses}}};local count=0;"
+        "for _,window in ipairs(hl.get_workspace_windows(workspace)) do "
+        "if window.mapped and not window.floating then count=count+1;"
+        "if not expected[window.address] then error(\"Pane Ratio windows changed\") end end end;"
+        "if count~=2 then error(\"Pane Ratio windows changed\") end;"
+        f'hl.dispatch(hl.dsp.layout("splitratio {exact:.6f} exact"))'
+    )
+    hyprctl.eval(expression, deadline=deadline)
+    time.sleep(0.08)
+    verified = read_state(hyprctl, deadline=deadline)
+    if not verified.eligible or verified.workspace != first.workspace or verified.addresses != first.addresses:
+        raise PaneRatioError("workspace windows changed before the ratio could be verified")
+    if verified.left_share is None or abs(verified.left_share - expected_share) > RATIO_TOLERANCE:
+        raise PaneRatioError("Hyprland did not apply the requested ratio")
+    return LayoutState(
+        verified.workspace,
+        verified.layout,
+        verified.tiled_windows,
+        verified.orientation,
+        ratio,
+        verified.left_share,
+        verified.addresses,
+        verified.active_address,
+        True,
+        f"Applied {ratio}.",
+    )
+
+
+def emit(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+
+
+def main(arguments: list[str]) -> int:
+    try:
+        hyprctl = Hyprctl()
+        if arguments == ["status"]:
+            state = read_state(hyprctl)
+            emit(state.public())
+            return 0
+        if len(arguments) == 2 and arguments[0] == "apply":
+            state = apply_ratio(hyprctl, arguments[1])
+            emit(state.public(ok=state.eligible))
+            return 0 if state.eligible else 2
+        raise PaneRatioError("usage: pane-ratio status | pane-ratio apply {1:2|1:1|2:1}")
+    except PaneRatioError as error:
+        emit(
+            {
+                "ok": False,
+                "eligible": False,
+                "workspace": 0,
+                "layout": "unknown",
+                "tiledWindows": 0,
+                "orientation": "unknown",
+                "ratio": "",
+                "message": str(error),
+            }
+        )
+        return 1
+    except Exception:
+        emit(
+            {
+                "ok": False,
+                "eligible": False,
+                "workspace": 0,
+                "layout": "unknown",
+                "tiledWindows": 0,
+                "orientation": "unknown",
+                "ratio": "",
+                "message": "Pane Ratio encountered an unexpected internal error.",
+            }
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
