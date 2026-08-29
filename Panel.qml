@@ -212,7 +212,7 @@ Panel {
             text: "󰕭"
             color: root.accent
             font.family: root.fontFamily
-            font.pixelSize: Style.font.displaySmall
+            font.pixelSize: Style.font.iconLarge
             anchors.verticalCenter: parent.verticalCenter
           }
 
