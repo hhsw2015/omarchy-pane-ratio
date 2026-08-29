@@ -29,6 +29,14 @@ omarchy plugin add https://github.com/r404r/omarchy-pane-ratio.git --enable
 
 setup スクリプトや Hyprland の再読み込みは不要です。バックエンドはインストール済みのプラグインディレクトリから直接実行されます。
 
+## 動作要件
+
+- Omarchy Quattro のプラグインランタイム。
+- Lua API と `hyprctl` を備えた Hyprland。
+- Python 3。バックエンドは標準ライブラリだけを使用します。
+
+追加の Python パッケージ、特権コマンド、バックグラウンドサービス、ネットワークアクセスは不要です。
+
 ## アンインストール
 
 ```bash

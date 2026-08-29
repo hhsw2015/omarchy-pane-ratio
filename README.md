@@ -29,6 +29,14 @@ omarchy plugin add https://github.com/r404r/omarchy-pane-ratio.git --enable
 
 No setup script or Hyprland reload is required. The backend runs directly from the installed plugin directory.
 
+## Requirements
+
+- Omarchy Quattro's plugin runtime.
+- Hyprland with the Lua API and `hyprctl`.
+- Python 3; the backend uses only the standard library.
+
+No additional Python package, privileged command, background service, or network access is required.
+
 ## Remove
 
 ```bash
