@@ -20,6 +20,7 @@ Panel {
   property string currentRatio: ""
   property string intentRatio: ""
   property string intentState: "no_intent"
+  property bool backendSplitEligible: false
   property string errorText: ""
   property string statusText: "Checking current workspace…"
   property string statusOutput: ""
@@ -29,6 +30,7 @@ Panel {
   property bool statusFinishing: false
   property bool applyFinishing: false
   property bool clearFinishing: false
+  property bool splitFinishing: false
   property bool refreshPending: false
   property string pendingRatio: ""
 
@@ -38,7 +40,8 @@ Panel {
   readonly property string cliPath: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/io.github.r404r.pane-ratio/bin/pane-ratio"
   readonly property bool busy: statusProcess.running || applyProcess.running || clearProcess.running
-    || root.statusFinishing || root.applyFinishing || root.clearFinishing
+    || splitProcess.running || root.statusFinishing || root.applyFinishing
+    || root.clearFinishing || root.splitFinishing
   readonly property bool applying: applyProcess.running || root.applyFinishing
   readonly property bool eligible: errorText === "" && layoutName === "dwindle"
     && tiledWindows === 2 && orientation === "horizontal"
@@ -46,8 +49,9 @@ Panel {
   readonly property color mutedForeground: Qt.darker(foreground, 1.45)
   readonly property color accent: Color.accent
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-  readonly property int focusTargetCount: root.presets.length + 1
+  readonly property int focusTargetCount: root.presets.length + 2
     + (root.intentRatio === "" ? 0 : 1)
+  readonly property bool splitAvailable: !root.busy && root.backendSplitEligible
   readonly property var relevantEvents: [
     "openwindow", "closewindow", "movewindow", "movewindowv2",
     "changefloatingmode", "fullscreen", "activewindow", "activewindowv2",
@@ -124,6 +128,14 @@ Panel {
     clearProcess.running = true
   }
 
+  function toggleSplit() {
+    if (!root.splitAvailable) return
+    root.errorText = ""
+    root.statusText = "Switching pane direction…"
+    root.resetOutput(true)
+    splitProcess.running = true
+  }
+
   function consumeResult(output, overflow, exitCode, applying, requestedRatio) {
     if (overflow) {
       root.errorText = "Pane Ratio returned too much data."
@@ -140,6 +152,7 @@ Panel {
       root.currentRatio = String(state.ratio || "")
       root.intentRatio = String(state.intentRatio || "")
       root.intentState = String(state.state || "unknown")
+      root.backendSplitEligible = state.splitEligible === true
       if (Array.isArray(state.presets) && state.presets.length > 0) {
         var labels = []
         var shares = []
@@ -181,6 +194,7 @@ Panel {
     if (root.focusIndex === 0) root.refresh()
     else if (root.focusIndex <= root.presets.length)
       root.applyRatio(root.presets[root.focusIndex - 1])
+    else if (root.focusIndex === root.presets.length + 1) root.toggleSplit()
     else root.clearIntent()
   }
 
@@ -255,6 +269,24 @@ Panel {
     }
   }
 
+  Process {
+    id: splitProcess
+    command: [root.cliPath, "split", "toggle"]
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) { root.appendOutput(chunk, true) }
+    }
+    stderr: SplitParser { splitMarker: ""; onRead: function(chunk) {} }
+    onExited: function(exitCode) {
+      root.splitFinishing = true
+      Qt.callLater(function() {
+        root.consumeResult(root.applyOutput, root.applyOutputOverflow, exitCode, true, "")
+        root.splitFinishing = false
+        if (root.refreshPending) Qt.callLater(root.refresh)
+      })
+    }
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -282,6 +314,7 @@ Panel {
           if (index < root.presets.length) root.applyRatio(root.presets[index])
         }
         else if (text === "d" || text === "D") root.clearIntent()
+        else if (text === "s" || text === "S") root.toggleSplit()
       }
 
       Column {
@@ -462,16 +495,34 @@ Panel {
 
         Button {
           width: parent.width
+          text: root.orientation === "vertical"
+            ? "Switch to left ↔ right"
+            : "Switch to top ↕ bottom"
+          tooltipText: "Toggle the two-pane Dwindle split (S)"
+          bordered: true
+          focusable: true
+          hasCursor: root.focusIndex === root.presets.length + 1
+          enabled: root.splitAvailable
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.toggleSplit()
+          onHovered: function(hovered) {
+            if (hovered) root.focusIndex = root.presets.length + 1
+          }
+        }
+
+        Button {
+          width: parent.width
           text: root.intentRatio === "" ? "No saved workspace rule" : "Forget " + root.intentRatio + " for this workspace"
           tooltipText: "Remove saved ratio (D)"
           bordered: true
           focusable: true
-          hasCursor: root.focusIndex === root.presets.length + 1
+          hasCursor: root.focusIndex === root.presets.length + 2
           enabled: !root.busy && root.intentRatio !== ""
           foreground: root.foreground
           fontFamily: root.fontFamily
           onClicked: root.clearIntent()
-          onHovered: function(hovered) { if (hovered) root.focusIndex = root.presets.length + 1 }
+          onHovered: function(hovered) { if (hovered) root.focusIndex = root.presets.length + 2 }
         }
 
         Text {
@@ -499,7 +550,8 @@ Panel {
         Text {
           width: parent.width
           text: "Keys 1–" + root.presets.length + " choose ratios"
-            + (root.intentRatio === "" ? "" : " · D forget") + " · R refresh"
+            + " · S split" + (root.intentRatio === "" ? "" : " · D forget")
+            + " · R refresh"
           color: root.mutedForeground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

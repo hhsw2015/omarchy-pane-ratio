@@ -273,7 +273,104 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
             SPLIT_BIAS,
         )
         self.assertFalse(state.eligible)
-        self.assertEqual(state.orientation, "vertical")
+        self.assertEqual(state.orientation, "unknown")
+
+
+class SplitToggleTests(unittest.TestCase):
+    class FakeHyprctl(ApplyAndEdgeCaseTests.FakeHyprctl):
+        pass
+
+    @staticmethod
+    def horizontal():
+        return (
+            workspace(),
+            [client("0x1", 0, 0, 500, 800), client("0x2", 505, 0, 500, 800)],
+        )
+
+    @staticmethod
+    def vertical():
+        return (
+            workspace(),
+            [client("0x1", 0, 0, 1000, 400), client("0x2", 0, 405, 1000, 400)],
+        )
+
+    @classmethod
+    def vertical_reversed(cls):
+        current_workspace, clients = cls.vertical()
+        return current_workspace, list(reversed(clients))
+
+    def test_horizontal_split_toggles_to_vertical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            fake = self.FakeHyprctl(
+                [self.horizontal(), self.horizontal(), self.vertical_reversed()]
+            )
+            state = pane_ratio.toggle_split(fake, store)
+            self.assertEqual(state.orientation, "vertical")
+            self.assertIn('hl.dsp.layout("togglesplit")', fake.expression)
+            self.assertIn("if #windows~=2", fake.expression)
+            self.assertIn("if not horizontal then", fake.expression)
+            self.assertNotIn("if not vertical then", fake.expression)
+
+    def test_vertical_split_toggles_to_horizontal_and_reconciles_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set("1", "1:1")
+            fake = self.FakeHyprctl(
+                [
+                    self.vertical_reversed(),
+                    self.vertical(),
+                    self.horizontal(),
+                    self.horizontal(),
+                ]
+            )
+            state = pane_ratio.toggle_split(fake, store)
+            self.assertEqual(state.orientation, "horizontal")
+            self.assertEqual(state.phase, "applied")
+            self.assertIn("Switched to left and right", state.message)
+            self.assertIn("if not vertical then", fake.expression)
+            self.assertNotIn("if not horizontal then", fake.expression)
+
+    def test_three_windows_cannot_toggle_split(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            snapshot = (
+                workspace(),
+                [
+                    client("0x1", 0, 0, 300, 800),
+                    client("0x2", 305, 0, 300, 800),
+                    client("0x3", 610, 0, 300, 800),
+                ],
+            )
+            fake = self.FakeHyprctl([snapshot])
+            state = pane_ratio.toggle_split(fake, store)
+            self.assertEqual(state.tiled_windows, 3)
+            self.assertEqual(fake.expression, "")
+
+    def test_execute_rejected_toggle_reports_ok_false_and_exit_two(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            snapshot = (workspace(), [client("0x1", 0, 0, 1000, 800)])
+            fake = self.FakeHyprctl([snapshot])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = pane_ratio.execute(["split", "toggle"], fake, store, pane_ratio.PRESETS)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(code, 2)
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload["splitEligible"])
+
+    def test_floating_focus_is_not_split_eligible(self):
+        state = pane_ratio.analyze(
+            workspace(lastwindow="0x3"),
+            [
+                client("0x1", 0, 0, 500, 800),
+                client("0x2", 505, 0, 500, 800),
+                client("0x3", 100, 100, 300, 300, floating=True),
+            ],
+            SPLIT_BIAS,
+        )
+        self.assertFalse(state.split_eligible)
 
 
 class IntentStoreTests(unittest.TestCase):

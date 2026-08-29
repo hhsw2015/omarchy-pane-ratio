@@ -2,15 +2,15 @@
   "schemaVersion": 1,
   "id": "io.github.r404r.pane-ratio",
   "name": "Pane Ratio",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "r404r",
   "license": "MIT",
-  "description": "Save workspace ratio intentions and apply them when Dwindle topology is safe.",
+  "description": "Save workspace ratios, auto-apply them, and switch a safe two-pane split.",
   "kinds": ["service", "bar-widget"],
   "entryPoints": { "service": "PaneRatioService.qml", "barWidget": "BarWidget.qml" },
   "barWidget": {
     "displayName": "Pane Ratio",
-    "description": "Save and automatically apply workspace pane ratios",
+    "description": "Save workspace ratios and switch a safe two-pane split",
     "category": "Desktop",
     "allowMultiple": false,
     "defaultSection": "right"

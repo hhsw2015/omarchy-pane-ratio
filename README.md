@@ -8,6 +8,7 @@ Pane Ratio is an Omarchy bar plugin that remembers a left-to-right ratio for eac
 - Saves the selected ratio even when the workspace has zero or one tiled window.
 - Automatically applies the saved ratio when a second tiled window appears.
 - Pauses without changing geometry when three or more tiled windows are present, then resumes after the workspace returns to two.
+- Switches a safe two-pane Dwindle split between left/right and top/bottom without rearranging larger trees.
 - Detects and highlights the current preset, or shows `Custom` after manual resizing.
 - Ignores floating windows.
 - Refuses ambiguous layouts instead of guessing.
@@ -31,11 +32,14 @@ Keyboard controls inside the panel:
 
 - `1`–`9`: choose the preset at that position (the default list uses `1`–`5`)
 - `D`: forget the current workspace rule
+- `S`: switch two panes between left/right and top/bottom
 - `R`: refresh
 - Arrow keys and Enter: navigate and apply
 - Escape: close
 
 `Waiting` means the intention is saved and needs a second tiled window. `Paused` means the rule is retained but the current topology is unsafe to change. The plugin never changes a three-window tree by approximation.
+
+The split button mirrors Omarchy's `Super+J` “Toggle window split” for the plugin's deliberately narrower two-pane case. A top/bottom split pauses a saved left/right ratio; switching back to left/right automatically reapplies that saved ratio. `Super+L` is different: it changes the whole workspace between Dwindle and Scrolling and is not controlled by this button.
 
 ## Custom presets
 

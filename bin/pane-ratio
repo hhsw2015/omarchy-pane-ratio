@@ -64,6 +64,16 @@ class LayoutState:
     phase: str = "unknown"
     intent_ratio: str = ""
 
+    @property
+    def split_eligible(self) -> bool:
+        return (
+            self.workspace >= 0
+            and self.layout == "dwindle"
+            and self.tiled_windows == 2
+            and self.orientation in ("horizontal", "vertical")
+            and self.active_address in self.addresses
+        )
+
     def public(
         self, *, ok: bool = True, presets: dict[str, tuple[float, float]] | None = None
     ) -> dict[str, Any]:
@@ -78,6 +88,7 @@ class LayoutState:
             "ratio": self.ratio,
             "intentRatio": self.intent_ratio,
             "state": self.phase,
+            "splitEligible": self.split_eligible,
             "message": self.message,
         }
         if presets is not None:
@@ -595,8 +606,47 @@ def analyze(
         and abs((left[0] + left[2]) - right[0]) <= 16
         and overlap >= min(left[3], right[3]) * 0.9
     )
-    sorted_addresses = tuple(geometry[4]["address"] for geometry in geometries)
-    if not horizontal:
+    # Window identity must not depend on `hyprctl clients` order or on equal
+    # X coordinates in a vertical split. Geometry is sorted separately below.
+    sorted_addresses = tuple(sorted(addresses))
+    geometries.sort(key=lambda geometry: geometry[1])
+    top, bottom = geometries
+    horizontal_overlap = min(top[0] + top[2], bottom[0] + bottom[2]) - max(top[0], bottom[0])
+    vertical = (
+        top[1] < bottom[1]
+        and abs((top[1] + top[3]) - bottom[1]) <= 16
+        and horizontal_overlap >= min(top[2], bottom[2]) * 0.9
+    )
+    if not horizontal and not vertical:
+        return LayoutState(
+            workspace_id,
+            workspace_name,
+            layout,
+            2,
+            "unknown",
+            "",
+            None,
+            sorted_addresses,
+            active_address,
+            False,
+            "The two tiled windows do not form one clean split.",
+        )
+    if active_address not in sorted_addresses:
+        return LayoutState(
+            workspace_id,
+            workspace_name,
+            layout,
+            2,
+            "horizontal" if horizontal else "vertical",
+            "",
+            None,
+            sorted_addresses,
+            active_address,
+            False,
+            "Focus one of the two tiled windows before applying a ratio.",
+        )
+
+    if vertical:
         return LayoutState(
             workspace_id,
             workspace_name,
@@ -608,21 +658,7 @@ def analyze(
             sorted_addresses,
             active_address,
             False,
-            "The two tiled windows must be arranged left and right.",
-        )
-    if active_address not in sorted_addresses:
-        return LayoutState(
-            workspace_id,
-            workspace_name,
-            layout,
-            2,
-            "horizontal",
-            "",
-            None,
-            sorted_addresses,
-            active_address,
-            False,
-            "Focus one of the two tiled windows before applying a ratio.",
+            "The two tiled windows are arranged top and bottom.",
         )
 
     left_share = left[2] / (left[2] + right[2])
@@ -792,6 +828,104 @@ def reconcile(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     return apply_ratio(hyprctl, intention, store.presets)
 
 
+def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
+    deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
+    first = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if (
+        first.workspace < 0
+        or first.layout != "dwindle"
+        or first.tiled_windows != 2
+        or first.orientation not in ("horizontal", "vertical")
+        or first.active_address not in first.addresses
+    ):
+        return first.with_intent(
+            store.load().get(first.workspace_name, ""),
+            "paused_mode",
+            "Split direction needs exactly two clean Dwindle panes with one focused.",
+        )
+    second = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if (
+        second.workspace,
+        second.addresses,
+        second.active_address,
+        second.orientation,
+    ) != (
+        first.workspace,
+        first.addresses,
+        first.active_address,
+        first.orientation,
+    ):
+        raise PaneRatioError("workspace windows changed while toggling the split")
+
+    expected_addresses = ",".join(f'["{address}"]=true' for address in second.addresses)
+    orientation_guard = (
+        "if not horizontal then error(\"Pane Ratio orientation changed\") end;"
+        if second.orientation == "horizontal"
+        else "if not vertical then error(\"Pane Ratio orientation changed\") end;"
+    )
+    expression = (
+        "local active=hl.get_active_window();local workspace=hl.get_active_workspace();"
+        f'if active==nil or workspace==nil or active.address~="{second.active_address}" '
+        f'or workspace.id~={second.workspace} or workspace.tiled_layout~="dwindle" '
+        "then error(\"Pane Ratio target changed\") end;"
+        "local bias=hl.get_config(\"dwindle.split_bias\");"
+        "if bias~=0 then error(\"Pane Ratio split bias changed\") end;"
+        f"local expected={{{expected_addresses}}};local windows={{}};"
+        "for _,window in ipairs(hl.get_workspace_windows(workspace)) do "
+        "if window.mapped and not window.floating then "
+        "if window.fullscreen~=0 then error(\"Pane Ratio fullscreen changed\") end;"
+        "if window.group~=nil then error(\"Pane Ratio group changed\") end;"
+        "if window.layout==nil or window.layout.name~=\"dwindle\" then "
+        "error(\"Pane Ratio layout changed\") end;"
+        "if not expected[window.address] then error(\"Pane Ratio windows changed\") end;"
+        "table.insert(windows,window) end end;"
+        "if #windows~=2 then error(\"Pane Ratio windows changed\") end;"
+        "local left=windows[1];local right=windows[2];"
+        "if left.at.x>right.at.x then left,right=right,left end;"
+        "local hoverlap=math.min(left.at.y+left.size.y,right.at.y+right.size.y)-"
+        "math.max(left.at.y,right.at.y);"
+        "local horizontal=left.at.x<right.at.x and "
+        "math.abs((left.at.x+left.size.x)-right.at.x)<=16 and "
+        "hoverlap>=math.min(left.size.y,right.size.y)*0.9;"
+        "local top=windows[1];local bottom=windows[2];"
+        "if top.at.y>bottom.at.y then top,bottom=bottom,top end;"
+        "local voverlap=math.min(top.at.x+top.size.x,bottom.at.x+bottom.size.x)-"
+        "math.max(top.at.x,bottom.at.x);"
+        "local vertical=top.at.y<bottom.at.y and "
+        "math.abs((top.at.y+top.size.y)-bottom.at.y)<=16 and "
+        "voverlap>=math.min(top.size.x,bottom.size.x)*0.9;"
+    ) + orientation_guard + 'hl.dispatch(hl.dsp.layout("togglesplit"))'
+    hyprctl.eval(expression, deadline=deadline)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PaneRatioError("Pane Ratio operation timed out")
+    time.sleep(min(0.08, remaining))
+    verified = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    expected_orientation = "vertical" if first.orientation == "horizontal" else "horizontal"
+    if (
+        verified.workspace != first.workspace
+        or verified.addresses != first.addresses
+        or verified.orientation != expected_orientation
+    ):
+        raise PaneRatioError("Hyprland did not toggle the requested split direction")
+
+    intention = store.load().get(verified.workspace_name, "")
+    if verified.orientation == "horizontal" and intention in store.presets:
+        applied = reconcile(hyprctl, store)
+        return applied.with_intent(
+            intention,
+            applied.phase,
+            f"Switched to left and right. {applied.message}",
+        )
+    direction = "top and bottom" if verified.orientation == "vertical" else "left and right"
+    return verified.with_intent(
+        intention,
+        "split_vertical" if verified.orientation == "vertical" else "split_horizontal",
+        f"Switched to {direction}."
+        + (f" Saved ratio {intention} is paused." if intention else ""),
+    )
+
+
 def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
 
@@ -810,6 +944,11 @@ def execute(
         state = reconcile(hyprctl, store)
         emit(state.public(presets=presets))
         return 0
+    if arguments == ["split", "toggle"]:
+        state = toggle_split(hyprctl, store)
+        success = state.phase in ("split_vertical", "split_horizontal", "applied")
+        emit(state.public(ok=success, presets=presets))
+        return 0 if success else 2
     if len(arguments) == 3 and arguments[:2] == ["intent", "set"]:
         ratio = arguments[2]
         if ratio not in presets:
@@ -829,7 +968,9 @@ def execute(
         state = apply_ratio(hyprctl, arguments[1], presets)
         emit(state.public(ok=state.eligible, presets=presets))
         return 0 if state.eligible else 2
-    raise PaneRatioError("usage: pane-ratio status | reconcile | intent set PRESET | intent clear")
+    raise PaneRatioError(
+        "usage: pane-ratio status | reconcile | intent set PRESET | intent clear | split toggle"
+    )
 
 
 def main(arguments: list[str]) -> int:
