@@ -124,8 +124,19 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
             self.eval_error = eval_error
 
         def json(self, maximum_bytes, *arguments, deadline=None):
-            snapshot = self.snapshots[self.call_index // 3]
+            snapshot = self.snapshots[self.call_index // 4]
             self.call_index += 1
+            if arguments == ("monitors",):
+                return [
+                    {
+                        "focused": True,
+                        "activeWorkspace": {
+                            "id": snapshot[0]["id"],
+                            "name": snapshot[0]["name"],
+                        },
+                        "specialWorkspace": {"id": 0, "name": ""},
+                    }
+                ]
             if arguments == ("activeworkspace",):
                 return snapshot[0]
             if arguments == ("clients",):
@@ -201,7 +212,7 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
         with self.assertRaisesRegex(pane_ratio.PaneRatioError, "target changed"):
             pane_ratio.apply_ratio(fake, "2:1")
 
-        self.assertEqual(fake.call_index, 6)
+        self.assertEqual(fake.call_index, 8)
 
     def test_already_applied_ratio_is_idempotent(self):
         initial = self.snapshot(1000, 500)
@@ -211,7 +222,7 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
 
         self.assertEqual(state.phase, "applied")
         self.assertEqual(fake.expression, "")
-        self.assertEqual(fake.call_index, 6)
+        self.assertEqual(fake.call_index, 8)
 
     def test_expired_operation_deadline_does_not_spawn_process(self):
         with mock.patch.object(pane_ratio.subprocess, "Popen") as popen:
@@ -701,6 +712,7 @@ class IntentStoreTests(unittest.TestCase):
         service = (SCRIPT.parents[1] / "PaneRatioService.qml").read_text()
         self.assertIn('"activewindow"', service)
         self.assertIn('"activewindowv2"', service)
+        self.assertIn('"activespecial"', service)
 
 
 class IdentityMigrationAndProtocolTests(unittest.TestCase):
@@ -727,6 +739,91 @@ class IdentityMigrationAndProtocolTests(unittest.TestCase):
             self.assertEqual(result.kind, "unknown")
             self.assertEqual(result.raw_id, 0)
             self.assertIsNone(result.selector)
+
+    def test_focused_monitor_special_overlay_overrides_regular_workspace(self):
+        monitors = [
+            {
+                "focused": True,
+                "activeWorkspace": {"id": 2, "name": "2"},
+                "specialWorkspace": {"id": -99, "name": "special:test"},
+            }
+        ]
+        result = pane_ratio.focused_workspace_identity(monitors)
+        self.assertEqual(result.kind, "special")
+        self.assertEqual(result.display_name, "special:test")
+        self.assertIsNone(result.selector)
+
+    def test_focused_monitor_without_overlay_uses_regular_identity(self):
+        monitors = [
+            {
+                "focused": True,
+                "activeWorkspace": {"id": 7, "name": "renamed"},
+                "specialWorkspace": {"id": 0, "name": ""},
+            }
+        ]
+        self.assertEqual(
+            pane_ratio.focused_workspace_identity(monitors).selector, "id:7"
+        )
+
+    def test_ambiguous_focused_monitor_state_is_retryable(self):
+        with self.assertRaises(pane_ratio.PaneRatioError) as caught:
+            pane_ratio.focused_workspace_identity([])
+        self.assertEqual(caught.exception.reason_code, "hyprctl_invalid_json")
+        self.assertTrue(caught.exception.retryable)
+
+        duplicate_focus = [
+            {
+                "focused": True,
+                "activeWorkspace": {"id": 1, "name": "1"},
+                "specialWorkspace": {"id": 0, "name": ""},
+            },
+            {
+                "focused": True,
+                "activeWorkspace": {"id": 2, "name": "2"},
+                "specialWorkspace": {"id": 0, "name": ""},
+            },
+        ]
+        with self.assertRaises(pane_ratio.PaneRatioError) as caught:
+            pane_ratio.focused_workspace_identity(duplicate_focus)
+        self.assertEqual(caught.exception.reason_code, "hyprctl_invalid_json")
+        self.assertTrue(caught.exception.retryable)
+
+    def test_malformed_special_monitor_state_fails_closed(self):
+        monitors = [
+            {
+                "focused": True,
+                "activeWorkspace": {"id": 7, "name": "7"},
+                "specialWorkspace": {"id": -99, "name": ""},
+            }
+        ]
+        result = pane_ratio.focused_workspace_identity(monitors)
+        self.assertEqual(result.kind, "unknown")
+        self.assertFalse(result.supported)
+        self.assertIsNone(result.selector)
+
+    def test_monitor_and_activeworkspace_race_fails_before_client_read(self):
+        class RacedHyprctl:
+            def __init__(self):
+                self.calls = []
+
+            def json(self, maximum_bytes, *arguments, deadline=None):
+                self.calls.append(arguments)
+                if arguments == ("monitors",):
+                    return [
+                        {
+                            "focused": True,
+                            "activeWorkspace": {"id": 1, "name": "1"},
+                            "specialWorkspace": {"id": 0, "name": ""},
+                        }
+                    ]
+                if arguments == ("activeworkspace",):
+                    return workspace(id=2, name="2")
+                raise AssertionError("client/config read occurred after identity race")
+
+        hyprctl = RacedHyprctl()
+        with self.assertRaises(pane_ratio.ActiveWorkspaceChangedError):
+            pane_ratio.read_state(hyprctl)
+        self.assertEqual(hyprctl.calls, [("monitors",), ("activeworkspace",)])
 
     def test_named_layout_uses_hash_filename_and_escaped_exact_selector(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -760,6 +857,17 @@ class IdentityMigrationAndProtocolTests(unittest.TestCase):
     def test_special_workspace_intent_command_rejects_without_state_mutation(self):
         class SpecialHyprctl:
             def json(self, maximum_bytes, *arguments, deadline=None):
+                if arguments == ("monitors",):
+                    return [
+                        {
+                            "focused": True,
+                            "activeWorkspace": {"id": 1, "name": "1"},
+                            "specialWorkspace": {
+                                "id": -99,
+                                "name": "special:scratch",
+                            },
+                        }
+                    ]
                 if arguments == ("activeworkspace",):
                     return workspace(id=-99, name="special:scratch")
                 if arguments == ("clients",):
@@ -780,6 +888,39 @@ class IdentityMigrationAndProtocolTests(unittest.TestCase):
             self.assertEqual(payload["state"], "special_workspace")
             self.assertEqual(payload["reasonCode"], "special_workspace")
             self.assertFalse(store.path.exists())
+
+    def test_intent_set_workspace_race_never_reconciles_second_workspace(self):
+        first = (
+            workspace(id=1, name="1"),
+            [client("0x1", 0, 0, 1000, 800)],
+        )
+        second = (
+            workspace(id=2, name="2"),
+            [
+                client(
+                    "0x3", 0, 0, 500, 800,
+                    workspace={"id": 2, "name": "2"},
+                ),
+                client(
+                    "0x4", 505, 0, 500, 800,
+                    workspace={"id": 2, "name": "2"},
+                ),
+            ],
+        )
+        hyprctl = ApplyAndEdgeCaseTests.FakeHyprctl([first, second])
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            store.set(identity(id=2, name="2"), "3:1")
+            with self.assertRaises(pane_ratio.ActiveWorkspaceChangedError) as caught:
+                pane_ratio.execute(
+                    ["intent", "set", "1:1"], hyprctl, store,
+                    pane_ratio.PRESETS,
+                )
+            self.assertEqual(store.resolve(identity(id=1, name="1")), ("1:1", False))
+            self.assertEqual(store.resolve(identity(id=2, name="2")), ("3:1", False))
+        self.assertEqual(caught.exception.reason_code, "active_target_changed")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(hyprctl.expressions, [])
 
     def test_v1_named_rule_is_inactive_until_explicit_adoption(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -951,6 +1092,34 @@ class IdentityMigrationAndProtocolTests(unittest.TestCase):
 
 
 class BackgroundCallBudgetTests(unittest.TestCase):
+    def test_special_overlay_background_path_uses_one_call_and_is_read_only(self):
+        class SpecialMonitorHyprctl:
+            def __init__(self):
+                self.calls = 0
+
+            def json(self, maximum_bytes, *arguments, deadline=None):
+                self.calls += 1
+                self.arguments = arguments
+                return [
+                    {
+                        "focused": True,
+                        "activeWorkspace": {"id": 1, "name": "1"},
+                        "specialWorkspace": {
+                            "id": -99,
+                            "name": "special:test",
+                        },
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            hyprctl = SpecialMonitorHyprctl()
+            state = pane_ratio.reconcile_background(hyprctl, store)
+        self.assertEqual(state.phase, "special_workspace")
+        self.assertEqual(state.reason_code, "special_workspace")
+        self.assertEqual(hyprctl.calls, 1)
+        self.assertEqual(hyprctl.arguments, ("monitors",))
+
     def test_no_intent_background_path_uses_one_hyprctl_call(self):
         class OneCallHyprctl:
             def __init__(self):
@@ -959,7 +1128,13 @@ class BackgroundCallBudgetTests(unittest.TestCase):
             def json(self, maximum_bytes, *arguments, deadline=None):
                 self.calls += 1
                 self.assert_arguments = arguments
-                return workspace()
+                return [
+                    {
+                        "focused": True,
+                        "activeWorkspace": {"id": 1, "name": "1"},
+                        "specialWorkspace": {"id": 0, "name": ""},
+                    }
+                ]
 
         with tempfile.TemporaryDirectory() as directory:
             store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
@@ -967,9 +1142,9 @@ class BackgroundCallBudgetTests(unittest.TestCase):
             state = pane_ratio.reconcile_background(hyprctl, store)
         self.assertEqual(state.phase, "no_intent")
         self.assertEqual(hyprctl.calls, 1)
-        self.assertEqual(hyprctl.assert_arguments, ("activeworkspace",))
+        self.assertEqual(hyprctl.assert_arguments, ("monitors",))
 
-    def test_paused_intent_background_path_uses_three_hyprctl_calls(self):
+    def test_paused_intent_background_path_uses_four_hyprctl_calls(self):
         snapshot = (
             workspace(),
             [client("0x1", 0, 0, 1000, 800)],
@@ -980,9 +1155,9 @@ class BackgroundCallBudgetTests(unittest.TestCase):
             store.set(identity(), "2:1")
             state = pane_ratio.reconcile_background(hyprctl, store)
         self.assertEqual(state.phase, "waiting_window")
-        self.assertEqual(hyprctl.call_index, 3)
+        self.assertEqual(hyprctl.call_index, 4)
 
-    def test_apply_background_path_uses_ten_total_hyprctl_interactions(self):
+    def test_apply_background_path_uses_thirteen_total_hyprctl_interactions(self):
         initial = ApplyAndEdgeCaseTests.snapshot(500, 500)
         verified = ApplyAndEdgeCaseTests.snapshot(1000, 500)
         hyprctl = ApplyAndEdgeCaseTests.FakeHyprctl([initial, initial, verified])
@@ -991,7 +1166,7 @@ class BackgroundCallBudgetTests(unittest.TestCase):
             store.set(identity(), "2:1")
             state = pane_ratio.reconcile_background(hyprctl, store)
         self.assertEqual(state.phase, "applied")
-        self.assertEqual(hyprctl.call_index, 9)
+        self.assertEqual(hyprctl.call_index, 12)
         self.assertEqual(len(hyprctl.expressions), 1)
 
 
@@ -1002,6 +1177,17 @@ class ReconcileTests(unittest.TestCase):
             self.current_clients = current_clients
 
         def json(self, maximum_bytes, *arguments, deadline=None):
+            if arguments == ("monitors",):
+                return [
+                    {
+                        "focused": True,
+                        "activeWorkspace": {
+                            "id": self.current_workspace["id"],
+                            "name": self.current_workspace["name"],
+                        },
+                        "specialWorkspace": {"id": 0, "name": ""},
+                    }
+                ]
             if arguments == ("activeworkspace",):
                 return self.current_workspace
             if arguments == ("clients",):

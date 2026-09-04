@@ -47,10 +47,12 @@ PRESETS = {
 }
 ADDRESS_RE = re.compile(r"0x[0-9A-Fa-f]+")
 MAX_WORKSPACE_BYTES = 65536
+MAX_MONITORS_BYTES = 262144
 MAX_CLIENTS_BYTES = 1048576
 MAX_OPTION_BYTES = 16384
 MAX_EVAL_BYTES = 65536
 MAX_CLIENTS = 4096
+MAX_MONITORS = 64
 COMMAND_TIMEOUT_SECONDS = 2.0
 APPLY_TIMEOUT_SECONDS = 5.0
 LOCK_TIMEOUT_SECONDS = 20.0
@@ -902,6 +904,48 @@ def _pair(value: Any) -> tuple[int, int] | None:
     return first, second
 
 
+def focused_workspace_identity(monitors: Any) -> WorkspaceIdentity:
+    """Resolve the focused monitor's visible workspace, including overlays."""
+
+    if not isinstance(monitors, list) or len(monitors) > MAX_MONITORS:
+        raise TransientPaneRatioError(
+            "hyprctl returned an invalid monitor list",
+            reason_code="hyprctl_invalid_json",
+        )
+    focused = [
+        monitor
+        for monitor in monitors
+        if isinstance(monitor, dict) and monitor.get("focused") is True
+    ]
+    if len(focused) != 1:
+        raise TransientPaneRatioError(
+            "hyprctl did not report exactly one focused monitor",
+            reason_code="hyprctl_invalid_json",
+        )
+    monitor = focused[0]
+    special = monitor.get("specialWorkspace")
+    if not isinstance(special, dict):
+        raise TransientPaneRatioError(
+            "hyprctl omitted the focused monitor special-workspace state",
+            reason_code="hyprctl_invalid_json",
+        )
+    special_id = _integer(special.get("id"))
+    special_name = special.get("name")
+    if special_id == 0 and special_name == "":
+        return workspace_identity(monitor.get("activeWorkspace"))
+    special_identity = workspace_identity(special)
+    if special_identity.kind != "special":
+        return WorkspaceIdentity("unknown", 0, "", None)
+    return special_identity
+
+
+def active_workspace_identity(
+    hyprctl: Hyprctl, *, deadline: float | None = None
+) -> WorkspaceIdentity:
+    monitors = hyprctl.json(MAX_MONITORS_BYTES, "monitors", deadline=deadline)
+    return focused_workspace_identity(monitors)
+
+
 def _ratio_label(
     left_share: float, presets: dict[str, tuple[float, float]] = PRESETS
 ) -> str:
@@ -1130,10 +1174,30 @@ def read_state(
     deadline: float | None = None,
     presets: dict[str, tuple[float, float]] = PRESETS,
     workspace: Any | None = None,
+    active_identity: WorkspaceIdentity | None = None,
 ) -> LayoutState:
+    if active_identity is None:
+        active_identity = active_workspace_identity(hyprctl, deadline=deadline)
+    if not active_identity.supported:
+        return analyze(
+            {
+                "id": active_identity.raw_id,
+                "name": active_identity.display_name,
+                "tiledLayout": "unknown",
+                "lastwindow": "",
+                "hasfullscreen": False,
+            },
+            [],
+            {"int": 0},
+            presets,
+        )
     if workspace is None:
         workspace = hyprctl.json(
             MAX_WORKSPACE_BYTES, "activeworkspace", deadline=deadline
+        )
+    if not _same_workspace(workspace_identity(workspace), active_identity):
+        raise ActiveWorkspaceChangedError(
+            "the focused workspace changed while Pane Ratio was reading it"
         )
     clients = hyprctl.json(MAX_CLIENTS_BYTES, "clients", deadline=deadline)
     split_bias = hyprctl.json(
@@ -1320,8 +1384,14 @@ def reconcile(
     store: IntentStore,
     expected_identity: WorkspaceIdentity | None = None,
     workspace: Any | None = None,
+    active_identity: WorkspaceIdentity | None = None,
 ) -> LayoutState:
-    state = read_state(hyprctl, presets=store.presets, workspace=workspace)
+    state = read_state(
+        hyprctl,
+        presets=store.presets,
+        workspace=workspace,
+        active_identity=active_identity,
+    )
     if expected_identity is not None and not _same_workspace(
         state.identity, expected_identity
     ):
@@ -1362,12 +1432,11 @@ def reconcile(
 
 
 def reconcile_background(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
-    workspace = hyprctl.json(MAX_WORKSPACE_BYTES, "activeworkspace")
-    identity = workspace_identity(workspace)
-    layout = workspace.get("tiledLayout") if isinstance(workspace, dict) else "unknown"
-    layout = layout if isinstance(layout, str) else "unknown"
+    identity = active_workspace_identity(hyprctl)
     if not identity.supported:
-        return read_state(hyprctl, presets=store.presets, workspace=workspace)
+        return read_state(
+            hyprctl, presets=store.presets, active_identity=identity
+        )
     intention, migration_required = store.resolve(identity)
     if not intention:
         reason = "migration_required" if migration_required else "no_intent"
@@ -1378,7 +1447,7 @@ def reconcile_background(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
         )
         return LayoutState(
             identity,
-            layout,
+            "unknown",
             0,
             "unknown",
             "",
@@ -1391,7 +1460,7 @@ def reconcile_background(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
             "",
             reason,
         )
-    return reconcile(hyprctl, store, workspace=workspace)
+    return reconcile(hyprctl, store, active_identity=identity)
 
 
 def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
@@ -1720,7 +1789,7 @@ def execute(
             emit(state.public(operation, ok=False, presets=presets))
             return 2
         store.set(state.identity, ratio)
-        state = reconcile(hyprctl, store)
+        state = reconcile(hyprctl, store, expected_identity=state.identity)
         emit(state.public(operation, presets=presets))
         return 0
     if arguments == ["intent", "clear"]:

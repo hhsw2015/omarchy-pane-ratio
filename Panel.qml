@@ -64,7 +64,7 @@ Panel {
   readonly property var relevantEvents: [
     "openwindow", "closewindow", "movewindow", "movewindowv2",
     "changefloatingmode", "fullscreen", "activewindow", "activewindowv2",
-    "workspace", "workspacev2", "focusedmon", "focusedmonv2",
+    "workspace", "workspacev2", "activespecial", "focusedmon", "focusedmonv2",
     "togglegroup", "moveintogroup", "moveoutofgroup", "renameworkspace",
     "configreloaded"
   ]
