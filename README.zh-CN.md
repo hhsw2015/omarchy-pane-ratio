@@ -21,6 +21,8 @@ Pane Ratio 是一款 Omarchy 状态栏插件：它可以为每个工作区选择
 
 自动应用有意限定为 Dwindle 工作区中恰好两个、横向排列、未分组且非全屏的窗口。Scrolling 与多层 Dwindle 窗口树需要不同语义，插件不会在后台近似处理它们。
 
+正 ID 工作区始终按数字 ID 跟踪，即使显示名称发生变化。Hyprland 命名工作区按完整且区分大小写的名称跟踪：重命名后旧规则会休眠；以后明确复用同一名称时，其比例和布局规则会一起重新生效。特殊工作区和无法可靠分类的工作区在面板中只读。
+
 ## 安装
 
 ```bash
@@ -61,6 +63,8 @@ omarchy plugin remove io.github.r404r.pane-ratio
 
 `Waiting` 表示比例意图已保存，正在等待第二个平铺窗口。`Paused` 表示规则仍然保留，只是当前窗口拓扑结构不适合安全调整。插件绝不会通过近似方式修改三窗口树。
 
+从 0.4 升级后，首次使用时会把比例状态迁移到 schema 2。规范的正整数键继续作为数字工作区 ID 生效；旧的非数字键会保持休眠，直到你在目标命名工作区中明确重新保存比例。面板会显示 `migration_required`，不会猜测对应关系。0.4 无法读取 schema 2；如需回退到 0.4，必须先恢复升级前备份的 `intents.json`。
+
 Dwindle 与 Scrolling 按钮对应 Omarchy 的 `Super+L` 工作区布局选择，但它们会明确显示目标，而不是盲目反转。选择会写入 `~/.local/state/omarchy/workspace-layouts/`，Omarchy 启动时也会从这里恢复布局。在 Scrolling 中，已保存的比例会暂停；工作区回到 Dwindle 且形成安全的双窗口拓扑后，比例会继续生效。
 
 分割按钮对应 Omarchy 的 `Super+J`“切换窗口分割”，但插件有意将其限制在更安全的双窗口场景。切换为上下分割时会暂停已保存的左右比例；切回左右后会自动重新应用。工作区布局与 Dwindle 分割方向是两项独立控制。
@@ -82,19 +86,19 @@ Dwindle 与 Scrolling 按钮对应 Omarchy 的 `Super+L` 工作区布局选择�
 ## 安全模型
 
 - 比例参数来自固定允许列表；拒绝任意命令和任意 Lua。
-- 比例状态与 Omarchy 兼容的工作区布局规则都有大小上限、允许列表，并可抵御符号链接攻击；使用私有权限（目录 `0700`、文件 `0600`）并以原子方式替换。
+- 比例状态与 Omarchy 兼容的工作区布局规则都有大小上限、允许列表，并可抵御符号链接攻击，且以原子方式替换。比例状态目录使用私有权限 `0700`，状态文件和规则文件使用 `0600`；插件不会更改 Omarchy 共享布局目录的权限。
 - 以带超时和 schema 检查的有界 JSON 解析 `hyprctl` 输出。
 - 应用前会两次检查工作区、窗口地址、焦点和布局。
 - 调度前，原子 Lua guard 会再次检查窗口集合、焦点、Dwindle 布局、split bias、窗口组、全屏状态和横向几何。Hyprland 的 Lua 窗口 API 不公开 Pseudotile，因此插件不会将它作为独立策略标志，而是对其应用相同的几何条件。
 - 操作后会读回并验证窗口几何。
-- 轻量 Omarchy QML 服务以 `140 ms` 防抖响应相关 Hyprland 事件；没有轮询、特权命令、网络访问或用户配置写入。
+- 轻量 Omarchy QML 服务以 `140 ms` 防抖响应相关 Hyprland 事件，并且最多只运行一个请求。瞬时故障会分别在 `250`、`500`、`1000 ms` 后重试，随后停止；没有轮询、特权命令、网络访问或用户配置写入。
 
 ## 开发
 
 ```bash
 python -m unittest discover -s tests -v
 omarchy plugin validate .
-qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml PaneRatioService.qml
+qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml PaneRatioProtocol.qml ReconcileScheduler.qml PaneRatioService.qml
 ```
 
 ## 许可证

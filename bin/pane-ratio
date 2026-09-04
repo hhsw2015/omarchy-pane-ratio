@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Safely apply ratio presets to exactly two horizontal Dwindle windows."""
 
 from __future__ import annotations
@@ -6,10 +6,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import pwd
 import re
 import fcntl
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
@@ -19,6 +19,23 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from pane_ratio_contract import (  # noqa: E402
+    PROTOCOL_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
+    ActiveWorkspaceChangedError,
+    PaneRatioError,
+    TransientPaneRatioError,
+    WorkspaceIdentity,
+    error_payload,
+    lua_string,
+    validate_selector,
+    workspace_identity,
+)
 
 
 PRESETS = {
@@ -40,31 +57,20 @@ LOCK_TIMEOUT_SECONDS = 20.0
 RATIO_TOLERANCE = 0.035
 MAX_STATE_BYTES = 65536
 MAX_CONFIG_BYTES = 16384
-MAX_WORKSPACE_NAME_CHARS = 128
-STATE_SCHEMA_VERSION = 1
 WORKSPACE_LAYOUTS = ("dwindle", "scrolling")
-
-
-class PaneRatioError(RuntimeError):
-    """Expected operational or validation failure."""
 
 
 class WorkspaceLayoutPersistenceError(PaneRatioError):
     """Persistence failed, with whether atomic replacement already occurred."""
 
     def __init__(self, message: str, *, committed: bool) -> None:
-        super().__init__(message)
+        super().__init__(message, reason_code="persistence_failed")
         self.committed = committed
-
-
-class ActiveWorkspaceChangedError(PaneRatioError):
-    """The user changed workspace during a guarded operation."""
 
 
 @dataclass(frozen=True)
 class LayoutState:
-    workspace: int
-    workspace_name: str
+    identity: WorkspaceIdentity
     layout: str
     tiled_windows: int
     orientation: str
@@ -76,11 +82,20 @@ class LayoutState:
     message: str
     phase: str = "unknown"
     intent_ratio: str = ""
+    reason_code: str = "none"
+
+    @property
+    def workspace(self) -> int:
+        return self.identity.raw_id
+
+    @property
+    def workspace_name(self) -> str:
+        return self.identity.display_name
 
     @property
     def split_eligible(self) -> bool:
         return (
-            self.workspace >= 0
+            self.identity.supported
             and self.layout == "dwindle"
             and self.tiled_windows == 2
             and self.orientation in ("horizontal", "vertical")
@@ -89,16 +104,23 @@ class LayoutState:
 
     @property
     def layout_eligible(self) -> bool:
-        return self.workspace >= 0 and self.layout in WORKSPACE_LAYOUTS
+        return self.identity.supported and self.layout in WORKSPACE_LAYOUTS
 
     def public(
-        self, *, ok: bool = True, presets: dict[str, tuple[float, float]] | None = None
+        self,
+        operation: str,
+        *,
+        ok: bool = True,
+        presets: dict[str, tuple[float, float]] | None = None,
     ) -> dict[str, Any]:
         payload = {
+            "schemaVersion": PROTOCOL_SCHEMA_VERSION,
             "ok": ok,
+            "operation": operation,
+            "retryable": False,
+            "reasonCode": self.reason_code,
             "eligible": self.eligible,
-            "workspace": self.workspace,
-            "workspaceName": self.workspace_name,
+            "workspace": self.identity.public(),
             "layout": self.layout,
             "tiledWindows": self.tiled_windows,
             "orientation": self.orientation,
@@ -116,10 +138,15 @@ class LayoutState:
             ]
         return payload
 
-    def with_intent(self, ratio: str, phase: str, message: str) -> "LayoutState":
+    def with_intent(
+        self,
+        ratio: str,
+        phase: str,
+        message: str,
+        reason_code: str | None = None,
+    ) -> "LayoutState":
         return LayoutState(
-            self.workspace,
-            self.workspace_name,
+            self.identity,
             self.layout,
             self.tiled_windows,
             self.orientation,
@@ -131,15 +158,35 @@ class LayoutState:
             message,
             phase,
             ratio,
+            reason_code or self.reason_code,
         )
 
 
+def _xdg_base(variable: str, fallback: tuple[str, ...], reason_code: str) -> Path:
+    configured = os.environ.get(variable)
+    if configured:
+        base = Path(configured)
+        if not base.is_absolute():
+            raise PaneRatioError(
+                f"{variable} must be an absolute path", reason_code=reason_code
+            )
+        return base
+    try:
+        base = Path(pwd.getpwuid(os.getuid()).pw_dir).joinpath(*fallback)
+    except (KeyError, OSError) as error:
+        raise PaneRatioError(
+            "could not resolve the current account home directory",
+            reason_code=reason_code,
+        ) from error
+    if not base.is_absolute():
+        raise PaneRatioError(
+            "the current account home directory is invalid", reason_code=reason_code
+        )
+    return base
+
+
 def _config_path() -> Path:
-    override = os.environ.get("PANE_RATIO_CONFIG_FILE")
-    if override:
-        return Path(override)
-    xdg_config = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg_config) if xdg_config else Path.home() / ".config"
+    base = _xdg_base("XDG_CONFIG_HOME", (".config",), "invalid_config")
     return base / "omarchy-pane-ratio" / "presets.json"
 
 
@@ -166,28 +213,54 @@ def load_presets(path: Path | None = None) -> dict[str, tuple[float, float]]:
     except FileNotFoundError:
         return dict(PRESETS)
     except OSError as error:
-        raise PaneRatioError("could not safely open Pane Ratio preset configuration") from error
+        raise PaneRatioError(
+            "could not safely open Pane Ratio preset configuration",
+            reason_code="invalid_config",
+        ) from error
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES:
-            raise PaneRatioError("Pane Ratio preset configuration is invalid or too large")
-        raw = os.read(descriptor, MAX_CONFIG_BYTES + 1)
+            raise PaneRatioError(
+                "Pane Ratio preset configuration is invalid or too large",
+                reason_code="invalid_config",
+            )
+        raw = bytearray()
+        while len(raw) <= MAX_CONFIG_BYTES:
+            chunk = os.read(descriptor, min(4096, MAX_CONFIG_BYTES + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
         if len(raw) > MAX_CONFIG_BYTES:
-            raise PaneRatioError("Pane Ratio preset configuration is too large")
+            raise PaneRatioError(
+                "Pane Ratio preset configuration is too large",
+                reason_code="invalid_config",
+            )
     finally:
         os.close(descriptor)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise PaneRatioError("Pane Ratio preset configuration contains invalid JSON") from error
+        raise PaneRatioError(
+            "Pane Ratio preset configuration contains invalid JSON",
+            reason_code="invalid_config",
+        ) from error
     labels = payload.get("presets") if isinstance(payload, dict) and payload.get("schemaVersion") == 1 else None
     if not isinstance(labels, list) or not 1 <= len(labels) <= 9:
-        raise PaneRatioError("Pane Ratio preset configuration must contain 1 to 9 presets")
+        raise PaneRatioError(
+            "Pane Ratio preset configuration must contain 1 to 9 presets",
+            reason_code="invalid_config",
+        )
     result: dict[str, tuple[float, float]] = {}
     for label in labels:
-        canonical, values = _preset(label)
+        try:
+            canonical, values = _preset(label)
+        except PaneRatioError as error:
+            raise PaneRatioError(str(error), reason_code="invalid_config") from error
         if canonical in result:
-            raise PaneRatioError("Pane Ratio preset configuration contains duplicate ratios")
+            raise PaneRatioError(
+                "Pane Ratio preset configuration contains duplicate ratios",
+                reason_code="invalid_config",
+            )
         result[canonical] = values
     return result
 
@@ -202,13 +275,10 @@ class IntentStore:
     ) -> None:
         self.presets = presets or dict(PRESETS)
         if state_dir is None:
-            override = os.environ.get("PANE_RATIO_STATE_DIR")
-            if override:
-                state_dir = Path(override)
-            else:
-                xdg_state = os.environ.get("XDG_STATE_HOME")
-                state_dir = Path(xdg_state) if xdg_state else Path.home() / ".local/state"
-                state_dir = state_dir / "omarchy-pane-ratio"
+            state_dir = _xdg_base(
+                "XDG_STATE_HOME", (".local", "state"), "state_permission"
+            )
+            state_dir = state_dir / "omarchy-pane-ratio"
         self.directory = state_dir
         self.path = state_dir / "intents.json"
         self.lock_path = state_dir / ".lock"
@@ -216,12 +286,18 @@ class IntentStore:
 
     def _open_directory(self) -> int:
         if not self.directory.is_absolute():
-            raise PaneRatioError("Pane Ratio state directory must be absolute")
+            raise PaneRatioError(
+                "Pane Ratio state directory must be absolute",
+                reason_code="state_permission",
+            )
         try:
             current = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
             for component in self.directory.parts[1:]:
                 if component in ("", ".", ".."):
-                    raise PaneRatioError("Pane Ratio state directory is invalid")
+                    raise PaneRatioError(
+                        "Pane Ratio state directory is invalid",
+                        reason_code="state_permission",
+                    )
                 try:
                     os.mkdir(component, mode=0o700, dir_fd=current)
                 except FileExistsError:
@@ -246,7 +322,10 @@ class IntentStore:
                 os.close(current)
             except (OSError, UnboundLocalError):
                 pass
-            raise PaneRatioError("could not prepare Pane Ratio state directory") from error
+            raise PaneRatioError(
+                "could not prepare Pane Ratio state directory",
+                reason_code="state_permission",
+            ) from error
 
     @contextmanager
     def _directory(self):
@@ -274,7 +353,10 @@ class IntentStore:
             )
             info = os.fstat(lock_fd)
             if not stat.S_ISREG(info.st_mode):
-                raise PaneRatioError("Pane Ratio operation lock is not a regular file")
+                raise PaneRatioError(
+                    "Pane Ratio operation lock is not a regular file",
+                    reason_code="state_permission",
+                )
             os.fchmod(lock_fd, 0o600)
             deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
             while True:
@@ -283,11 +365,16 @@ class IntentStore:
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise PaneRatioError("Pane Ratio is busy; try again")
+                        raise TransientPaneRatioError(
+                            "Pane Ratio is busy; try again", reason_code="lock_busy"
+                        )
                     time.sleep(0.025)
             yield
         except OSError as error:
-            raise PaneRatioError("could not safely lock Pane Ratio operations") from error
+            raise PaneRatioError(
+                "could not safely lock Pane Ratio operations",
+                reason_code="state_permission",
+            ) from error
         finally:
             if lock_fd >= 0:
                 try:
@@ -298,16 +385,25 @@ class IntentStore:
             os.close(directory_fd)
 
     @staticmethod
-    def _validate_workspace_name(name: str) -> None:
-        if (
-            not isinstance(name, str)
-            or not name
-            or len(name) > MAX_WORKSPACE_NAME_CHARS
-            or any(ord(character) < 32 for character in name)
+    def _validate_legacy_name(name: str) -> None:
+        if not isinstance(name, str) or not name:
+            raise PaneRatioError(
+                "legacy workspace name is invalid", reason_code="state_invalid"
+            )
+        try:
+            encoded = name.encode("utf-8", "strict")
+        except UnicodeEncodeError as error:
+            raise PaneRatioError(
+                "legacy workspace name is invalid", reason_code="state_invalid"
+            ) from error
+        if len(encoded) > 128 or any(
+            ord(character) < 32 or ord(character) == 127 for character in name
         ):
-            raise PaneRatioError("workspace name cannot be stored safely")
+            raise PaneRatioError(
+                "legacy workspace name is invalid", reason_code="state_invalid"
+            )
 
-    def load(self) -> dict[str, str]:
+    def _read_payload(self) -> dict[str, Any] | None:
         with self._directory() as directory_fd:
             try:
                 descriptor = os.open(
@@ -316,13 +412,19 @@ class IntentStore:
                     dir_fd=directory_fd,
                 )
             except FileNotFoundError:
-                return {}
+                return None
             except OSError as error:
-                raise PaneRatioError("could not safely open Pane Ratio intentions") from error
+                raise PaneRatioError(
+                    "could not safely open Pane Ratio intentions",
+                    reason_code="state_permission",
+                ) from error
             try:
                 info = os.fstat(descriptor)
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STATE_BYTES:
-                    raise PaneRatioError("Pane Ratio intentions file is invalid or too large")
+                    raise PaneRatioError(
+                        "Pane Ratio intentions file is invalid or too large",
+                        reason_code="state_invalid",
+                    )
                 raw = bytearray()
                 while len(raw) <= MAX_STATE_BYTES:
                     chunk = os.read(descriptor, min(16384, MAX_STATE_BYTES + 1 - len(raw)))
@@ -330,50 +432,138 @@ class IntentStore:
                         break
                     raw.extend(chunk)
                 if len(raw) > MAX_STATE_BYTES:
-                    raise PaneRatioError("Pane Ratio intentions file is too large")
+                    raise PaneRatioError(
+                        "Pane Ratio intentions file is too large",
+                        reason_code="state_invalid",
+                    )
             finally:
                 os.close(descriptor)
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise PaneRatioError("Pane Ratio intentions file contains invalid JSON") from error
-        if not isinstance(payload, dict) or payload.get("schemaVersion") != STATE_SCHEMA_VERSION:
-            raise PaneRatioError("Pane Ratio intentions use an unsupported schema")
-        workspaces = payload.get("workspaces")
-        if not isinstance(workspaces, dict) or len(workspaces) > 256:
-            raise PaneRatioError("Pane Ratio intentions have an invalid workspace map")
+            raise PaneRatioError(
+                "Pane Ratio intentions file contains invalid JSON",
+                reason_code="state_invalid",
+            ) from error
+        if not isinstance(payload, dict):
+            raise PaneRatioError(
+                "Pane Ratio intentions have an invalid shape",
+                reason_code="state_invalid",
+            )
+        return payload
+
+    def _validate_rules(
+        self, rules: Any, *, selectors: bool
+    ) -> dict[str, str]:
+        if not isinstance(rules, dict):
+            raise PaneRatioError(
+                "Pane Ratio intentions have an invalid workspace map",
+                reason_code="state_invalid",
+            )
         result: dict[str, str] = {}
-        for name, rule in workspaces.items():
-            self._validate_workspace_name(name)
+        for key, rule in rules.items():
+            if selectors:
+                key = validate_selector(key)
+            else:
+                self._validate_legacy_name(key)
             if not isinstance(rule, dict) or rule.get("enabled") is not True:
-                raise PaneRatioError("Pane Ratio intentions contain an invalid rule")
+                raise PaneRatioError(
+                    "Pane Ratio intentions contain an invalid rule",
+                    reason_code="state_invalid",
+                )
             try:
                 canonical, _values = _preset(rule.get("ratio"))
             except PaneRatioError as error:
-                raise PaneRatioError("Pane Ratio intentions contain an invalid rule") from error
+                raise PaneRatioError(
+                    "Pane Ratio intentions contain an invalid rule",
+                    reason_code="state_invalid",
+                ) from error
             if canonical != rule.get("ratio"):
-                raise PaneRatioError("Pane Ratio intentions contain a non-canonical rule")
-            result[name] = canonical
+                raise PaneRatioError(
+                    "Pane Ratio intentions contain a non-canonical rule",
+                    reason_code="state_invalid",
+                )
+            result[key] = canonical
         return result
 
+    def _load_state(self) -> tuple[dict[str, str], dict[str, str]]:
+        payload = self._read_payload()
+        if payload is None:
+            return {}, {}
+        schema = payload.get("schemaVersion")
+        if schema == 1:
+            old_rules = self._validate_rules(payload.get("workspaces"), selectors=False)
+            intentions: dict[str, str] = {}
+            legacy: dict[str, str] = {}
+            for name, ratio in old_rules.items():
+                if re.fullmatch(r"[1-9][0-9]*", name) and int(name) <= 2_147_483_647:
+                    intentions[f"id:{name}"] = ratio
+                else:
+                    legacy[name] = ratio
+            self._save_state(intentions, legacy)
+            return intentions, legacy
+        if schema != STATE_SCHEMA_VERSION:
+            raise PaneRatioError(
+                "Pane Ratio intentions use an unsupported schema",
+                reason_code="schema_unsupported",
+            )
+        intentions = self._validate_rules(payload.get("intents"), selectors=True)
+        legacy = self._validate_rules(payload.get("legacyV1", {}), selectors=False)
+        if len(intentions) + len(legacy) > 256:
+            raise PaneRatioError(
+                "Pane Ratio intentions have too many workspace rules",
+                reason_code="state_invalid",
+            )
+        return intentions, legacy
+
+    def load(self) -> dict[str, str]:
+        intentions, _legacy = self._load_state()
+        return intentions
+
     def save(self, intentions: dict[str, str]) -> None:
-        if len(intentions) > 256:
-            raise PaneRatioError("Pane Ratio cannot store more than 256 workspace rules")
-        for name, ratio in intentions.items():
-            self._validate_workspace_name(name)
+        _current, legacy = self._load_state()
+        self._save_state(intentions, legacy)
+
+    def _save_state(
+        self, intentions: dict[str, str], legacy: dict[str, str]
+    ) -> None:
+        if len(intentions) + len(legacy) > 256:
+            raise PaneRatioError(
+                "Pane Ratio cannot store more than 256 workspace rules",
+                reason_code="state_invalid",
+            )
+        for selector, ratio in intentions.items():
+            validate_selector(selector)
             canonical, _values = _preset(ratio)
             if canonical != ratio:
-                raise PaneRatioError("Pane Ratio intentions contain a non-canonical rule")
+                raise PaneRatioError(
+                    "Pane Ratio intentions contain a non-canonical rule",
+                    reason_code="state_invalid",
+                )
+        for name, ratio in legacy.items():
+            self._validate_legacy_name(name)
+            canonical, _values = _preset(ratio)
+            if canonical != ratio:
+                raise PaneRatioError(
+                    "Pane Ratio intentions contain a non-canonical legacy rule",
+                    reason_code="state_invalid",
+                )
         payload = {
             "schemaVersion": STATE_SCHEMA_VERSION,
-            "workspaces": {
+            "intents": {
+                selector: {"enabled": True, "ratio": ratio}
+                for selector, ratio in sorted(intentions.items())
+            },
+            "legacyV1": {
                 name: {"enabled": True, "ratio": ratio}
-                for name, ratio in sorted(intentions.items())
+                for name, ratio in sorted(legacy.items())
             },
         }
         encoded = (json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
         if len(encoded) > MAX_STATE_BYTES:
-            raise PaneRatioError("Pane Ratio intentions are too large")
+            raise PaneRatioError(
+                "Pane Ratio intentions are too large", reason_code="state_invalid"
+            )
         temporary: str | None = None
         with self._directory() as directory_fd:
             try:
@@ -391,7 +581,10 @@ class IntentStore:
                     except FileExistsError:
                         continue
                 else:
-                    raise PaneRatioError("could not create a temporary intentions file")
+                    raise PaneRatioError(
+                        "could not create a temporary intentions file",
+                        reason_code="state_permission",
+                    )
                 with os.fdopen(descriptor, "wb", closefd=True) as stream:
                     stream.write(encoded)
                     stream.flush()
@@ -399,7 +592,10 @@ class IntentStore:
                 try:
                     existing = os.stat("intents.json", dir_fd=directory_fd, follow_symlinks=False)
                     if stat.S_ISLNK(existing.st_mode):
-                        raise PaneRatioError("Pane Ratio intentions path must not be a symlink")
+                        raise PaneRatioError(
+                            "Pane Ratio intentions path must not be a symlink",
+                            reason_code="state_permission",
+                        )
                 except FileNotFoundError:
                     pass
                 os.replace(
@@ -413,7 +609,10 @@ class IntentStore:
             except PaneRatioError:
                 raise
             except OSError as error:
-                raise PaneRatioError("could not save Pane Ratio intentions") from error
+                raise PaneRatioError(
+                    "could not save Pane Ratio intentions",
+                    reason_code="state_permission",
+                ) from error
             finally:
                 if temporary is not None:
                     try:
@@ -421,16 +620,33 @@ class IntentStore:
                     except FileNotFoundError:
                         pass
 
-    def set(self, workspace_name: str, ratio: str) -> None:
-        intentions = self.load()
-        intentions[workspace_name] = ratio
-        self.save(intentions)
+    def resolve(self, identity: WorkspaceIdentity) -> tuple[str, bool]:
+        if not identity.supported or identity.selector is None:
+            return "", False
+        intentions, legacy = self._load_state()
+        ratio = intentions.get(identity.selector, "")
+        migration_required = not ratio and identity.display_name in legacy
+        return ratio, migration_required
 
-    def clear(self, workspace_name: str) -> None:
-        intentions = self.load()
-        if workspace_name in intentions:
-            del intentions[workspace_name]
-            self.save(intentions)
+    def set(self, identity: WorkspaceIdentity, ratio: str) -> None:
+        if not identity.supported or identity.selector is None:
+            raise PaneRatioError(
+                "this workspace cannot store a ratio", reason_code=identity.reason_code
+            )
+        intentions, legacy = self._load_state()
+        intentions[identity.selector] = ratio
+        legacy.pop(identity.display_name, None)
+        self._save_state(intentions, legacy)
+
+    def clear(self, identity: WorkspaceIdentity) -> None:
+        if not identity.supported or identity.selector is None:
+            raise PaneRatioError(
+                "this workspace has no ratio identity", reason_code=identity.reason_code
+            )
+        intentions, legacy = self._load_state()
+        if identity.selector in intentions:
+            del intentions[identity.selector]
+            self._save_state(intentions, legacy)
 
 
 class WorkspaceLayoutStore:
@@ -438,23 +654,26 @@ class WorkspaceLayoutStore:
 
     def __init__(self, state_dir: Path | None = None) -> None:
         if state_dir is None:
-            override = os.environ.get("PANE_RATIO_LAYOUT_STATE_DIR")
-            if override:
-                state_dir = Path(override)
-            else:
-                xdg_state = os.environ.get("XDG_STATE_HOME")
-                base = Path(xdg_state) if xdg_state else Path.home() / ".local/state"
-                state_dir = base / "omarchy" / "workspace-layouts"
+            base = _xdg_base(
+                "XDG_STATE_HOME", (".local", "state"), "state_permission"
+            )
+            state_dir = base / "omarchy" / "workspace-layouts"
         self.directory = state_dir
 
     def _open_directory(self) -> int:
         if not self.directory.is_absolute():
-            raise PaneRatioError("workspace layout state directory must be absolute")
+            raise PaneRatioError(
+                "workspace layout state directory must be absolute",
+                reason_code="state_permission",
+            )
         try:
             current = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
             for component in self.directory.parts[1:]:
                 if component in ("", ".", ".."):
-                    raise PaneRatioError("workspace layout state directory is invalid")
+                    raise PaneRatioError(
+                        "workspace layout state directory is invalid",
+                        reason_code="state_permission",
+                    )
                 try:
                     os.mkdir(component, mode=0o700, dir_fd=current)
                 except FileExistsError:
@@ -466,7 +685,6 @@ class WorkspaceLayoutStore:
                 )
                 os.close(current)
                 current = following
-            os.fchmod(current, 0o700)
             return current
         except PaneRatioError:
             try:
@@ -479,21 +697,27 @@ class WorkspaceLayoutStore:
                 os.close(current)
             except (OSError, UnboundLocalError):
                 pass
-            raise PaneRatioError("could not prepare workspace layout state") from error
+            raise PaneRatioError(
+                "could not prepare workspace layout state",
+                reason_code="state_permission",
+            ) from error
 
-    def save(self, workspace_id: int, layout: str) -> None:
-        if workspace_id < 0 or layout not in WORKSPACE_LAYOUTS:
-            raise PaneRatioError("invalid workspace layout rule")
-        filename = f"{workspace_id}.lua"
+    def save(self, identity: WorkspaceIdentity, layout: str) -> None:
+        if not identity.supported or layout not in WORKSPACE_LAYOUTS:
+            raise PaneRatioError(
+                "invalid workspace layout rule", reason_code="invalid_layout_rule"
+            )
+        filename = identity.layout_filename()
+        operand = lua_string(identity.layout_operand())
         encoded = (
-            f'hl.workspace_rule({{ workspace = "{workspace_id}", layout = "{layout}" }})\n'
+            f'hl.workspace_rule({{ workspace = {operand}, layout = "{layout}" }})\n'
         ).encode()
         directory_fd = self._open_directory()
         temporary: str | None = None
         replaced = False
         try:
             for attempt in range(32):
-                candidate = f".{workspace_id}.{os.getpid()}.{time.monotonic_ns()}.{attempt}"
+                candidate = f".{filename}.{os.getpid()}.{time.monotonic_ns()}.{attempt}"
                 try:
                     descriptor = os.open(
                         candidate,
@@ -506,7 +730,10 @@ class WorkspaceLayoutStore:
                 except FileExistsError:
                     continue
             else:
-                raise PaneRatioError("could not create a temporary workspace layout rule")
+                raise PaneRatioError(
+                    "could not create a temporary workspace layout rule",
+                    reason_code="state_permission",
+                )
             with os.fdopen(descriptor, "wb", closefd=True) as stream:
                 stream.write(encoded)
                 stream.flush()
@@ -514,7 +741,10 @@ class WorkspaceLayoutStore:
             try:
                 existing = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
                 if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
-                    raise PaneRatioError("workspace layout rule path is not a regular file")
+                    raise PaneRatioError(
+                        "workspace layout rule path is not a regular file",
+                        reason_code="state_permission",
+                    )
             except FileNotFoundError:
                 pass
             os.replace(temporary, filename, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
@@ -544,11 +774,17 @@ def _kill_process(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
+def _sanitized_error_detail(raw: bytes) -> str:
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", raw.decode("utf-8", "replace")).strip()[:240]
+
+
 def bounded_command(
     arguments: list[str], maximum_bytes: int, operation_deadline: float | None = None
 ) -> bytes:
     if operation_deadline is not None and time.monotonic() >= operation_deadline:
-        raise PaneRatioError("Pane Ratio operation timed out")
+        raise TransientPaneRatioError(
+            "Pane Ratio operation timed out", reason_code="operation_timeout"
+        )
     try:
         process = subprocess.Popen(
             arguments,
@@ -558,7 +794,9 @@ def bounded_command(
             start_new_session=True,
         )
     except OSError as error:
-        raise PaneRatioError(f"could not start {arguments[0]}") from error
+        raise TransientPaneRatioError(
+            f"could not start {arguments[0]}", reason_code="hyprctl_unavailable"
+        ) from error
     assert process.stdout is not None and process.stderr is not None
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, "stdout")
@@ -574,7 +812,9 @@ def bounded_command(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_process(process)
-                raise PaneRatioError(f"{arguments[0]} timed out")
+                raise TransientPaneRatioError(
+                    f"{arguments[0]} timed out", reason_code="hyprctl_timeout"
+                )
             events = selector.select(remaining)
             if not events:
                 continue
@@ -587,28 +827,48 @@ def bounded_command(
                 destination.extend(chunk)
                 if len(output) + len(errors) > maximum_bytes:
                     _kill_process(process)
-                    raise PaneRatioError(f"{arguments[0]} returned too much data")
+                    raise TransientPaneRatioError(
+                        f"{arguments[0]} returned too much data",
+                        reason_code="hyprctl_exit",
+                    )
         return_code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired as error:
         _kill_process(process)
-        raise PaneRatioError(f"{arguments[0]} timed out") from error
+        raise TransientPaneRatioError(
+            f"{arguments[0]} timed out", reason_code="hyprctl_timeout"
+        ) from error
     finally:
         selector.close()
 
     if return_code != 0:
-        detail = errors.decode("utf-8", "replace").strip().replace("\n", " ")[:240]
-        raise PaneRatioError(
+        detail = _sanitized_error_detail(bytes(errors))
+        raise TransientPaneRatioError(
             f"{arguments[0]} failed with exit status {return_code}"
-            + (f": {detail}" if detail else "")
+            + (f": {detail}" if detail else ""),
+            reason_code="hyprctl_exit",
         )
     return bytes(output)
 
 
 class Hyprctl:
     def __init__(self, executable: str | None = None) -> None:
-        self.executable = executable or shutil.which("hyprctl") or ""
-        if not self.executable or not os.path.isabs(self.executable):
-            raise PaneRatioError("hyprctl was not found")
+        self.executable = executable or "/usr/bin/hyprctl"
+        try:
+            info = os.stat(self.executable, follow_symlinks=True)
+        except OSError as error:
+            raise TransientPaneRatioError(
+                "hyprctl was not found", reason_code="hyprctl_unavailable"
+            ) from error
+        if (
+            not os.path.isabs(self.executable)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+            or not os.access(self.executable, os.X_OK)
+        ):
+            raise PaneRatioError(
+                "hyprctl executable is not trusted", reason_code="hyprctl_unavailable"
+            )
 
     def json(
         self, maximum_bytes: int, *arguments: str, deadline: float | None = None
@@ -619,7 +879,9 @@ class Hyprctl:
         try:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise PaneRatioError("hyprctl returned invalid JSON") from error
+            raise TransientPaneRatioError(
+                "hyprctl returned invalid JSON", reason_code="hyprctl_invalid_json"
+            ) from error
 
     def eval(self, expression: str, *, deadline: float | None = None) -> None:
         bounded_command(
@@ -653,31 +915,62 @@ def analyze(
     split_bias: Any,
     presets: dict[str, tuple[float, float]] = PRESETS,
 ) -> LayoutState:
-    if not isinstance(workspace, dict):
-        raise PaneRatioError("active workspace has an unexpected shape")
-    workspace_id = _integer(workspace.get("id"))
-    if workspace_id is None:
-        raise PaneRatioError("active workspace has no numeric ID")
-    layout = workspace.get("tiledLayout")
+    identity = workspace_identity(workspace)
+    workspace_id = identity.raw_id
+    workspace_object = workspace if isinstance(workspace, dict) else {}
+    layout = workspace_object.get("tiledLayout")
     layout = layout if isinstance(layout, str) else "unknown"
-    workspace_name = workspace.get("name")
-    workspace_name = workspace_name if isinstance(workspace_name, str) and workspace_name else str(workspace_id)
-    active_address = workspace.get("lastwindow")
+    active_address = workspace_object.get("lastwindow")
     active_address = active_address if isinstance(active_address, str) else ""
 
-    def unavailable(message: str, count: int = 0, orientation: str = "unknown") -> LayoutState:
+    def unavailable(
+        message: str,
+        reason_code: str,
+        count: int = 0,
+        orientation: str = "unknown",
+        phase: str = "paused_mode",
+    ) -> LayoutState:
         return LayoutState(
-            workspace_id, workspace_name, layout, count, orientation, "", None, (), active_address, False, message
+            identity,
+            layout,
+            count,
+            orientation,
+            "",
+            None,
+            (),
+            active_address,
+            False,
+            message,
+            phase,
+            "",
+            reason_code,
         )
 
-    if workspace_id < 0:
-        return unavailable("Special workspaces are not supported.")
+    if identity.kind == "unknown":
+        return unavailable(
+            "The active workspace identity is invalid.",
+            "unknown_workspace",
+            phase="unknown_workspace",
+        )
+    if identity.kind == "special":
+        return unavailable(
+            "Special workspaces are not supported.",
+            "special_workspace",
+            phase="special_workspace",
+        )
     if layout != "dwindle":
-        return unavailable("Pane Ratio currently supports the Dwindle layout only.")
-    if workspace.get("hasfullscreen") is not False:
-        return unavailable("Exit fullscreen before changing the pane ratio.")
+        return unavailable(
+            "Pane Ratio currently supports the Dwindle layout only.",
+            "unsupported_layout",
+        )
+    if workspace_object.get("hasfullscreen") is not False:
+        return unavailable(
+            "Exit fullscreen before changing the pane ratio.", "fullscreen"
+        )
     if not isinstance(split_bias, dict) or _integer(split_bias.get("int")) != 0:
-        return unavailable("The Dwindle split_bias option must be 0 (directional).")
+        return unavailable(
+            "The Dwindle split_bias option must be 0 (directional).", "split_bias"
+        )
     if not isinstance(clients, list) or len(clients) > MAX_CLIENTS:
         raise PaneRatioError("Hyprland returned an unexpected client list")
 
@@ -694,11 +987,15 @@ def analyze(
 
     if len(tiled) < 2:
         return unavailable(
-            f"Waiting for a second tiled window; found {len(tiled)}.", len(tiled)
+            f"Waiting for a second tiled window; found {len(tiled)}.",
+            "waiting_window",
+            len(tiled),
         )
     if len(tiled) > 2:
         return unavailable(
-            f"Paused because this workspace has {len(tiled)} tiled windows.", len(tiled)
+            f"Paused because this workspace has {len(tiled)} tiled windows.",
+            "topology",
+            len(tiled),
         )
 
     addresses: list[str] = []
@@ -712,10 +1009,14 @@ def analyze(
         if position is None or size is None or size[0] <= 0 or size[1] <= 0:
             raise PaneRatioError("a tiled window has invalid geometry")
         if client.get("fullscreen") not in (0, False):
-            return unavailable("Exit fullscreen before changing the pane ratio.", 2)
+            return unavailable(
+                "Exit fullscreen before changing the pane ratio.", "fullscreen", 2
+            )
         grouped = client.get("grouped")
         if not isinstance(grouped, list) or grouped:
-            return unavailable("Grouped windows are not supported.", 2)
+            return unavailable(
+                "Grouped windows are not supported.", "grouped_windows", 2
+            )
         addresses.append(address)
         geometries.append((position[0], position[1], size[0], size[1], client))
 
@@ -740,8 +1041,7 @@ def analyze(
     )
     if not horizontal and not vertical:
         return LayoutState(
-            workspace_id,
-            workspace_name,
+            identity,
             layout,
             2,
             "unknown",
@@ -751,11 +1051,13 @@ def analyze(
             active_address,
             False,
             "The two tiled windows do not form one clean split.",
+            "paused_mode",
+            "",
+            "ambiguous_split",
         )
     if active_address not in sorted_addresses:
         return LayoutState(
-            workspace_id,
-            workspace_name,
+            identity,
             layout,
             2,
             "horizontal" if horizontal else "vertical",
@@ -765,12 +1067,14 @@ def analyze(
             active_address,
             False,
             "Focus one of the two tiled windows before applying a ratio.",
+            "paused_mode",
+            "",
+            "focus_required",
         )
 
     if vertical:
         return LayoutState(
-            workspace_id,
-            workspace_name,
+            identity,
             layout,
             2,
             "vertical",
@@ -780,12 +1084,14 @@ def analyze(
             active_address,
             False,
             "The two tiled windows are arranged top and bottom.",
+            "paused_mode",
+            "",
+            "vertical_split",
         )
 
     left_share = left[2] / (left[2] + right[2])
     return LayoutState(
-        workspace_id,
-        workspace_name,
+        identity,
         layout,
         2,
         "horizontal",
@@ -795,7 +1101,27 @@ def analyze(
         active_address,
         True,
         "Ready.",
+        "eligible",
+        "",
+        "ready",
     )
+
+
+def _same_workspace(first: WorkspaceIdentity, second: WorkspaceIdentity) -> bool:
+    return (
+        first.supported
+        and second.supported
+        and first.kind == second.kind
+        and first.selector == second.selector
+        and first.raw_id == second.raw_id
+    )
+
+
+def _lua_workspace_guard(identity: WorkspaceIdentity, variable: str = "workspace") -> str:
+    guard = f"{variable}.id~={identity.raw_id}"
+    if identity.kind == "named":
+        guard += f" or {variable}.name~={lua_string(identity.display_name)}"
+    return guard
 
 
 def read_state(
@@ -803,10 +1129,12 @@ def read_state(
     *,
     deadline: float | None = None,
     presets: dict[str, tuple[float, float]] = PRESETS,
+    workspace: Any | None = None,
 ) -> LayoutState:
-    workspace = hyprctl.json(
-        MAX_WORKSPACE_BYTES, "activeworkspace", deadline=deadline
-    )
+    if workspace is None:
+        workspace = hyprctl.json(
+            MAX_WORKSPACE_BYTES, "activeworkspace", deadline=deadline
+        )
     clients = hyprctl.json(MAX_CLIENTS_BYTES, "clients", deadline=deadline)
     split_bias = hyprctl.json(
         MAX_OPTION_BYTES, "getoption", "dwindle:split_bias", deadline=deadline
@@ -818,13 +1146,18 @@ def apply_ratio(
     hyprctl: Hyprctl,
     ratio: str,
     presets: dict[str, tuple[float, float]] = PRESETS,
-    expected_workspace: int | None = None,
+    expected_identity: WorkspaceIdentity | None = None,
+    initial_state: LayoutState | None = None,
 ) -> LayoutState:
     if ratio not in presets:
-        raise PaneRatioError("unsupported ratio preset")
+        raise PaneRatioError(
+            "unsupported ratio preset", reason_code="unsupported_ratio"
+        )
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
-    first = read_state(hyprctl, deadline=deadline, presets=presets)
-    if expected_workspace is not None and first.workspace != expected_workspace:
+    first = initial_state or read_state(hyprctl, deadline=deadline, presets=presets)
+    if expected_identity is not None and not _same_workspace(
+        first.identity, expected_identity
+    ):
         raise ActiveWorkspaceChangedError(
             "active workspace changed before the ratio could be applied"
         )
@@ -832,15 +1165,18 @@ def apply_ratio(
         return first
     second = read_state(hyprctl, deadline=deadline, presets=presets)
     if not second.eligible or (
-        first.workspace,
+        first.identity,
         first.addresses,
         first.active_address,
     ) != (
-        second.workspace,
+        second.identity,
         second.addresses,
         second.active_address,
     ):
-        raise PaneRatioError("workspace windows changed while applying the ratio; try again")
+        raise TransientPaneRatioError(
+            "workspace windows changed while applying the ratio; try again",
+            reason_code="target_changed",
+        )
 
     exact, expected_share = presets[ratio]
     if second.left_share is not None and abs(second.left_share - expected_share) <= RATIO_TOLERANCE:
@@ -852,7 +1188,7 @@ def apply_ratio(
         "local active=hl.get_active_window();"
         "local workspace=hl.get_active_workspace();"
         f'if active==nil or workspace==nil or active.address~="{second.active_address}" '
-        f'or workspace.id~={second.workspace} or workspace.tiled_layout~="dwindle" '
+        f'or {_lua_workspace_guard(second.identity)} or workspace.tiled_layout~="dwindle" '
         "then error(\"Pane Ratio target changed\") end;"
         "local bias=hl.get_config(\"dwindle.split_bias\");"
         "if bias~=0 then error(\"Pane Ratio split bias changed\") end;"
@@ -879,16 +1215,23 @@ def apply_ratio(
     hyprctl.eval(expression, deadline=deadline)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise PaneRatioError("Pane Ratio operation timed out")
+        raise TransientPaneRatioError(
+            "Pane Ratio operation timed out", reason_code="operation_timeout"
+        )
     time.sleep(min(0.08, remaining))
     verified = read_state(hyprctl, deadline=deadline, presets=presets)
     if not verified.eligible or verified.workspace != first.workspace or verified.addresses != first.addresses:
-        raise PaneRatioError("workspace windows changed before the ratio could be verified")
+        raise TransientPaneRatioError(
+            "workspace windows changed before the ratio could be verified",
+            reason_code="target_changed",
+        )
     if verified.left_share is None or abs(verified.left_share - expected_share) > RATIO_TOLERANCE:
-        raise PaneRatioError("Hyprland did not apply the requested ratio")
+        raise TransientPaneRatioError(
+            "Hyprland did not apply the requested ratio",
+            reason_code="target_changed",
+        )
     return LayoutState(
-        verified.workspace,
-        verified.workspace_name,
+        verified.identity,
         verified.layout,
         verified.tiled_windows,
         verified.orientation,
@@ -900,39 +1243,74 @@ def apply_ratio(
         f"Applied {ratio}.",
         "applied",
         ratio,
+        "applied",
     )
 
 
 def classify_with_intent(state: LayoutState, ratio: str) -> LayoutState:
-    message_lower = state.message.lower()
-    if (
-        state.workspace < 0
-        or state.layout != "dwindle"
-        or "fullscreen" in message_lower
-        or "split_bias" in message_lower
-    ):
+    if state.reason_code in {
+        "unsupported_layout",
+        "fullscreen",
+        "split_bias",
+        "grouped_windows",
+        "focus_required",
+        "vertical_split",
+        "ambiguous_split",
+    }:
         return state.with_intent(ratio, "paused_mode", f"{ratio} saved; {state.message}")
-    if state.tiled_windows < 2 and state.layout == "dwindle":
-        return state.with_intent(ratio, "waiting", f"{ratio} saved; waiting for a second tiled window.")
-    if state.tiled_windows > 2 and state.layout == "dwindle":
-        return state.with_intent(ratio, "paused_topology", f"{ratio} saved; paused with {state.tiled_windows} tiled windows.")
+    if state.reason_code == "waiting_window":
+        return state.with_intent(
+            ratio,
+            "waiting_window",
+            f"{ratio} saved; waiting for a second tiled window.",
+        )
+    if state.reason_code == "topology":
+        return state.with_intent(
+            ratio,
+            "paused_topology",
+            f"{ratio} saved; paused with {state.tiled_windows} tiled windows.",
+        )
     if not state.eligible:
         return state.with_intent(ratio, "paused_mode", f"{ratio} saved; {state.message}")
     if state.ratio == ratio:
-        return state.with_intent(ratio, "applied", f"Ratio {ratio} is applied.")
-    return state.with_intent(ratio, "eligible", f"{ratio} is ready to apply.")
+        return state.with_intent(
+            ratio, "applied", f"Ratio {ratio} is applied.", "applied"
+        )
+    return state.with_intent(
+        ratio, "eligible", f"{ratio} is ready to apply.", "ready"
+    )
+
+
+def _intent_for_state(
+    state: LayoutState, store: IntentStore
+) -> tuple[str, bool]:
+    if not state.identity.supported:
+        return "", False
+    return store.resolve(state.identity)
 
 
 def status_with_intent(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     state = read_state(hyprctl, presets=store.presets)
-    intention = store.load().get(state.workspace_name, "")
+    if not state.identity.supported:
+        return state
+    intention, migration_required = _intent_for_state(state, store)
+    if migration_required:
+        return state.with_intent(
+            "",
+            "migration_required",
+            "A legacy rule with this display name is inactive; save a ratio to adopt it.",
+            "migration_required",
+        )
     if not intention:
-        return state.with_intent("", "no_intent", "No saved ratio for this workspace.")
+        return state.with_intent(
+            "", "no_intent", "No saved ratio for this workspace.", "no_intent"
+        )
     if intention not in store.presets:
         return state.with_intent(
             intention,
             "paused_config",
             f"Saved ratio {intention} is not in the current preset configuration.",
+            "paused_config",
         )
     return classify_with_intent(state, intention)
 
@@ -940,21 +1318,36 @@ def status_with_intent(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
 def reconcile(
     hyprctl: Hyprctl,
     store: IntentStore,
-    expected_workspace: int | None = None,
+    expected_identity: WorkspaceIdentity | None = None,
+    workspace: Any | None = None,
 ) -> LayoutState:
-    state = read_state(hyprctl, presets=store.presets)
-    if expected_workspace is not None and state.workspace != expected_workspace:
+    state = read_state(hyprctl, presets=store.presets, workspace=workspace)
+    if expected_identity is not None and not _same_workspace(
+        state.identity, expected_identity
+    ):
         raise ActiveWorkspaceChangedError(
             "active workspace changed before its ratio could be restored"
         )
-    intention = store.load().get(state.workspace_name, "")
+    if not state.identity.supported:
+        return state
+    intention, migration_required = _intent_for_state(state, store)
+    if migration_required:
+        return state.with_intent(
+            "",
+            "migration_required",
+            "A legacy rule with this display name is inactive; save a ratio to adopt it.",
+            "migration_required",
+        )
     if not intention:
-        return state.with_intent("", "no_intent", "No saved ratio for this workspace.")
+        return state.with_intent(
+            "", "no_intent", "No saved ratio for this workspace.", "no_intent"
+        )
     if intention not in store.presets:
         return state.with_intent(
             intention,
             "paused_config",
             f"Saved ratio {intention} is not in the current preset configuration.",
+            "paused_config",
         )
     classified = classify_with_intent(state, intention)
     if classified.phase != "eligible":
@@ -963,33 +1356,68 @@ def reconcile(
         hyprctl,
         intention,
         store.presets,
-        expected_workspace=state.workspace,
+        expected_identity=state.identity,
+        initial_state=state,
     )
+
+
+def reconcile_background(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
+    workspace = hyprctl.json(MAX_WORKSPACE_BYTES, "activeworkspace")
+    identity = workspace_identity(workspace)
+    layout = workspace.get("tiledLayout") if isinstance(workspace, dict) else "unknown"
+    layout = layout if isinstance(layout, str) else "unknown"
+    if not identity.supported:
+        return read_state(hyprctl, presets=store.presets, workspace=workspace)
+    intention, migration_required = store.resolve(identity)
+    if not intention:
+        reason = "migration_required" if migration_required else "no_intent"
+        message = (
+            "A legacy rule with this display name is inactive; save a ratio to adopt it."
+            if migration_required
+            else "No saved ratio for this workspace."
+        )
+        return LayoutState(
+            identity,
+            layout,
+            0,
+            "unknown",
+            "",
+            None,
+            (),
+            "",
+            False,
+            message,
+            reason,
+            "",
+            reason,
+        )
+    return reconcile(hyprctl, store, workspace=workspace)
 
 
 def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
     first = read_state(hyprctl, deadline=deadline, presets=store.presets)
     if (
-        first.workspace < 0
+        not first.identity.supported
         or first.layout != "dwindle"
         or first.tiled_windows != 2
         or first.orientation not in ("horizontal", "vertical")
         or first.active_address not in first.addresses
     ):
         return first.with_intent(
-            store.load().get(first.workspace_name, ""),
+            _intent_for_state(first, store)[0],
             "paused_mode",
             "Split direction needs exactly two clean Dwindle panes with one focused.",
+            first.reason_code,
         )
     second = read_state(hyprctl, deadline=deadline, presets=store.presets)
     if (
-        second.workspace,
+        second.identity,
         second.addresses,
         second.active_address,
         second.orientation,
     ) != (
-        first.workspace,
+        first.identity,
         first.addresses,
         first.active_address,
         first.orientation,
@@ -1005,7 +1433,7 @@ def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     expression = (
         "local active=hl.get_active_window();local workspace=hl.get_active_workspace();"
         f'if active==nil or workspace==nil or active.address~="{second.active_address}" '
-        f'or workspace.id~={second.workspace} or workspace.tiled_layout~="dwindle" '
+        f'or {_lua_workspace_guard(second.identity)} or workspace.tiled_layout~="dwindle" '
         "then error(\"Pane Ratio target changed\") end;"
         "local bias=hl.get_config(\"dwindle.split_bias\");"
         "if bias~=0 then error(\"Pane Ratio split bias changed\") end;"
@@ -1037,20 +1465,22 @@ def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     hyprctl.eval(expression, deadline=deadline)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise PaneRatioError("Pane Ratio operation timed out")
+        raise TransientPaneRatioError(
+            "Pane Ratio operation timed out", reason_code="operation_timeout"
+        )
     time.sleep(min(0.08, remaining))
     verified = read_state(hyprctl, deadline=deadline, presets=store.presets)
     expected_orientation = "vertical" if first.orientation == "horizontal" else "horizontal"
     if (
-        verified.workspace != first.workspace
+        not _same_workspace(verified.identity, first.identity)
         or verified.addresses != first.addresses
         or verified.orientation != expected_orientation
     ):
         raise PaneRatioError("Hyprland did not toggle the requested split direction")
 
-    intention = store.load().get(verified.workspace_name, "")
+    intention, _migration_required = _intent_for_state(verified, store)
     if verified.orientation == "horizontal" and intention in store.presets:
-        applied = reconcile(hyprctl, store, expected_workspace=verified.workspace)
+        applied = reconcile(hyprctl, store, expected_identity=verified.identity)
         return applied.with_intent(
             intention,
             applied.phase,
@@ -1075,7 +1505,7 @@ def set_workspace_layout(
         raise PaneRatioError("unsupported workspace layout")
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
     first = read_state(hyprctl, deadline=deadline, presets=store.presets)
-    intention = store.load().get(first.workspace_name, "")
+    intention, _migration_required = _intent_for_state(first, store)
     if not first.layout_eligible:
         return first.with_intent(
             intention,
@@ -1087,7 +1517,7 @@ def set_workspace_layout(
     if first.layout == target:
         warning = ""
         try:
-            layout_store.save(first.workspace, target)
+            layout_store.save(first.identity, target)
         except WorkspaceLayoutPersistenceError as error:
             if not error.committed:
                 raise
@@ -1099,28 +1529,30 @@ def set_workspace_layout(
         )
 
     second = read_state(hyprctl, deadline=deadline, presets=store.presets)
-    if (second.workspace, second.layout) != (first.workspace, first.layout):
+    if not _same_workspace(second.identity, first.identity) or second.layout != first.layout:
         raise PaneRatioError("workspace layout changed while switching; try again")
     expression = (
         "local workspace=hl.get_active_workspace();"
-        f'if workspace==nil or workspace.id~={second.workspace} '
+        f'if workspace==nil or {_lua_workspace_guard(second.identity)} '
         f'or workspace.tiled_layout~="{second.layout}" then '
         'error("Pane Ratio workspace changed") end;'
-        f'hl.workspace_rule({{ workspace = "{second.workspace}", layout = "{target}" }})'
+        f'hl.workspace_rule({{ workspace = {lua_string(second.identity.layout_operand())}, layout = "{target}" }})'
     )
     hyprctl.eval(expression, deadline=deadline)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise PaneRatioError("Pane Ratio operation timed out")
+        raise TransientPaneRatioError(
+            "Pane Ratio operation timed out", reason_code="operation_timeout"
+        )
     time.sleep(min(0.08, remaining))
     verified = read_state(hyprctl, deadline=deadline, presets=store.presets)
-    if verified.workspace != first.workspace or verified.layout != target:
+    if not _same_workspace(verified.identity, first.identity) or verified.layout != target:
         raise PaneRatioError("Hyprland did not apply the requested workspace layout")
 
     durability_warning = ""
     error_to_rollback: PaneRatioError | None = None
     try:
-        layout_store.save(verified.workspace, target)
+        layout_store.save(verified.identity, target)
     except WorkspaceLayoutPersistenceError as error:
         if error.committed:
             durability_warning = (
@@ -1134,19 +1566,21 @@ def set_workspace_layout(
     if error_to_rollback is not None:
         rollback = (
             "local workspace=hl.get_active_workspace();"
-            f'if workspace==nil or workspace.id~={verified.workspace} '
+            f'if workspace==nil or {_lua_workspace_guard(verified.identity)} '
             f'or workspace.tiled_layout~="{target}" then '
             'error("Pane Ratio workspace changed") end;'
-            f'hl.workspace_rule({{ workspace = "{verified.workspace}", layout = "{first.layout}" }})'
+            f'hl.workspace_rule({{ workspace = {lua_string(verified.identity.layout_operand())}, layout = "{first.layout}" }})'
         )
         try:
             hyprctl.eval(rollback, deadline=deadline)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise PaneRatioError("Pane Ratio operation timed out")
+                raise TransientPaneRatioError(
+                    "Pane Ratio operation timed out", reason_code="operation_timeout"
+                )
             time.sleep(min(0.08, remaining))
             restored = read_state(hyprctl, deadline=deadline, presets=store.presets)
-            if restored.workspace != first.workspace or restored.layout != first.layout:
+            if not _same_workspace(restored.identity, first.identity) or restored.layout != first.layout:
                 raise PaneRatioError("Hyprland did not confirm the rollback")
         except PaneRatioError as rollback_error:
             raise PaneRatioError(
@@ -1157,16 +1591,16 @@ def set_workspace_layout(
         ) from error_to_rollback
 
     final_state = read_state(hyprctl, deadline=deadline, presets=store.presets)
-    if final_state.workspace == verified.workspace:
+    if _same_workspace(final_state.identity, verified.identity):
         if final_state.layout != target:
-            layout_store.save(final_state.workspace, final_state.layout)
+            layout_store.save(final_state.identity, final_state.layout)
             raise PaneRatioError(
                 "workspace layout changed concurrently; the observed layout was persisted"
             )
         verified = final_state
 
     if target == "dwindle" and intention in store.presets:
-        if final_state.workspace != verified.workspace:
+        if not _same_workspace(final_state.identity, verified.identity):
             return verified.with_intent(
                 intention,
                 "layout_dwindle",
@@ -1177,7 +1611,7 @@ def set_workspace_layout(
             applied = reconcile(
                 hyprctl,
                 store,
-                expected_workspace=verified.workspace,
+                expected_identity=verified.identity,
             )
         except ActiveWorkspaceChangedError:
             return verified.with_intent(
@@ -1204,6 +1638,26 @@ def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
 
 
+def _operation(arguments: list[str]) -> str:
+    if arguments == ["status"]:
+        return "status"
+    if arguments == ["reconcile"] or arguments == ["reconcile-background"]:
+        return "reconcile"
+    if arguments[:2] == ["intent", "set"]:
+        return "intent_set"
+    if arguments == ["intent", "clear"]:
+        return "intent_clear"
+    if arguments == ["split", "toggle"]:
+        return "split_toggle"
+    if arguments[:2] == ["layout", "set"]:
+        return "layout_set"
+    if arguments == ["layout", "toggle"]:
+        return "layout_toggle"
+    if arguments[:1] == ["apply"]:
+        return "apply"
+    return "unknown"
+
+
 def execute(
     arguments: list[str],
     hyprctl: Hyprctl,
@@ -1211,18 +1665,23 @@ def execute(
     presets: dict[str, tuple[float, float]],
     layout_store: WorkspaceLayoutStore | None = None,
 ) -> int:
+    operation = _operation(arguments)
     if arguments == ["status"]:
         state = status_with_intent(hyprctl, store)
-        emit(state.public(presets=presets))
+        emit(state.public(operation, presets=presets))
         return 0
     if arguments == ["reconcile"]:
         state = reconcile(hyprctl, store)
-        emit(state.public(presets=presets))
+        emit(state.public(operation, presets=presets))
+        return 0
+    if arguments == ["reconcile-background"]:
+        state = reconcile_background(hyprctl, store)
+        emit(state.public(operation))
         return 0
     if arguments == ["split", "toggle"]:
         state = toggle_split(hyprctl, store)
         success = state.phase in ("split_vertical", "split_horizontal", "applied")
-        emit(state.public(ok=success, presets=presets))
+        emit(state.public(operation, ok=success, presets=presets))
         return 0 if success else 2
     if len(arguments) == 3 and arguments[:2] == ["layout", "set"]:
         target = arguments[2]
@@ -1238,7 +1697,7 @@ def execute(
             "layout_scrolling",
             "applied",
         )
-        emit(state.public(ok=success, presets=presets))
+        emit(state.public(operation, ok=success, presets=presets))
         return 0 if success else 2
     if arguments == ["layout", "toggle"]:
         state = set_workspace_layout(
@@ -1248,33 +1707,47 @@ def execute(
             "toggle",
         )
         success = state.phase in ("layout_dwindle", "layout_scrolling", "applied")
-        emit(state.public(ok=success, presets=presets))
+        emit(state.public(operation, ok=success, presets=presets))
         return 0 if success else 2
     if len(arguments) == 3 and arguments[:2] == ["intent", "set"]:
         ratio = arguments[2]
         if ratio not in presets:
-            raise PaneRatioError("unsupported ratio preset")
+            raise PaneRatioError(
+                "unsupported ratio preset", reason_code="unsupported_ratio"
+            )
         state = read_state(hyprctl, presets=presets)
-        store.set(state.workspace_name, ratio)
+        if not state.identity.supported:
+            emit(state.public(operation, ok=False, presets=presets))
+            return 2
+        store.set(state.identity, ratio)
         state = reconcile(hyprctl, store)
-        emit(state.public(presets=presets))
+        emit(state.public(operation, presets=presets))
         return 0
     if arguments == ["intent", "clear"]:
         state = read_state(hyprctl, presets=presets)
-        store.clear(state.workspace_name)
-        state = state.with_intent("", "no_intent", "Saved ratio removed from this workspace.")
-        emit(state.public(presets=presets))
+        if not state.identity.supported:
+            emit(state.public(operation, ok=False, presets=presets))
+            return 2
+        store.clear(state.identity)
+        state = state.with_intent(
+            "",
+            "no_intent",
+            "Saved ratio removed from this workspace.",
+            "no_intent",
+        )
+        emit(state.public(operation, presets=presets))
         return 0
     if len(arguments) == 2 and arguments[0] == "apply":
         state = apply_ratio(hyprctl, arguments[1], presets)
-        emit(state.public(ok=state.eligible, presets=presets))
+        emit(state.public(operation, ok=state.eligible, presets=presets))
         return 0 if state.eligible else 2
     raise PaneRatioError(
-        "usage: pane-ratio status | reconcile | intent set PRESET | intent clear | split toggle | layout set dwindle|scrolling | layout toggle"
+        "usage: pane-ratio status | reconcile | reconcile-background | intent set PRESET | intent clear | split toggle | layout set dwindle|scrolling | layout toggle"
     )
 
 
 def main(arguments: list[str]) -> int:
+    operation = _operation(arguments)
     try:
         presets = load_presets()
         hyprctl = Hyprctl()
@@ -1283,37 +1756,17 @@ def main(arguments: list[str]) -> int:
         with store.locked():
             return execute(arguments, hyprctl, store, presets, layout_store)
     except PaneRatioError as error:
-        emit(
-            {
-                "ok": False,
-                "eligible": False,
-                "workspace": 0,
-                "workspaceName": "",
-                "layout": "unknown",
-                "tiledWindows": 0,
-                "orientation": "unknown",
-                "ratio": "",
-                "intentRatio": "",
-                "state": "error",
-                "message": str(error),
-            }
-        )
+        emit(error_payload(operation, error))
         return 1
     except Exception:
         emit(
-            {
-                "ok": False,
-                "eligible": False,
-                "workspace": 0,
-                "workspaceName": "",
-                "layout": "unknown",
-                "tiledWindows": 0,
-                "orientation": "unknown",
-                "ratio": "",
-                "intentRatio": "",
-                "state": "error",
-                "message": "Pane Ratio encountered an unexpected internal error.",
-            }
+            error_payload(
+                operation,
+                PaneRatioError(
+                    "Pane Ratio encountered an unexpected internal error.",
+                    reason_code="internal",
+                ),
+            )
         )
         return 1
 

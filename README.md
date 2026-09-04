@@ -21,6 +21,8 @@ Pane Ratio is an Omarchy bar plugin for choosing Dwindle or Scrolling per worksp
 
 Automatic application deliberately supports exactly two horizontal, ungrouped, non-fullscreen windows on a Dwindle workspace. Scrolling and multi-level Dwindle trees need different semantics and are not silently approximated.
 
+Positive-ID workspaces are tracked by their numeric ID even if their display name changes. Hyprland named workspaces are tracked by their exact name: renaming one leaves the old rule dormant, and deliberately reusing that exact name reactivates its ratio and layout rule. Special and unclassifiable workspaces are read-only in the panel.
+
 ## Install
 
 ```bash
@@ -61,6 +63,8 @@ Keyboard controls inside the panel:
 
 `Waiting` means the intention is saved and needs a second tiled window. `Paused` means the rule is retained but the current topology is unsafe to change. The plugin never changes a three-window tree by approximation.
 
+Upgrading from 0.4 migrates ratio state to schema 2 on first use. Canonical positive-number keys keep working as numeric workspace IDs. Old nonnumeric keys remain inactive until you explicitly save a ratio on the intended named workspace; the panel reports `migration_required` instead of guessing. Schema 2 is not readable by 0.4, so restore a pre-upgrade copy of `intents.json` before rolling back to 0.4.
+
 The Dwindle and Scrolling buttons mirror Omarchy's `Super+L` workspace-layout choice, but are explicit instead of blindly toggling. The choice is written to `~/.local/state/omarchy/workspace-layouts/`, the same location Omarchy reloads on startup. A saved ratio pauses in Scrolling and resumes when the workspace returns to Dwindle and has a safe two-pane topology.
 
 The split button mirrors Omarchy's `Super+J` “Toggle window split” for the plugin's deliberately narrower two-pane case. A top/bottom split pauses a saved left/right ratio; switching back to left/right automatically reapplies that saved ratio. Workspace layout and Dwindle split direction are separate controls.
@@ -82,19 +86,19 @@ Use one to nine ratios. Each side must be an integer from 1 through 20. Ratios a
 ## Safety model
 
 - Ratio arguments are a fixed allowlist; arbitrary commands and arbitrary Lua are rejected.
-- Ratio state and Omarchy-compatible workspace layout rules are bounded, allowlisted, symlink-resistant, private (`0700` directories and `0600` files), and atomically replaced.
+- Ratio state and Omarchy-compatible workspace layout rules are bounded, allowlisted, symlink-resistant, and atomically replaced. The ratio-state directory is private (`0700`); state and rule files use `0600` without changing permissions on Omarchy's shared layout directory.
 - `hyprctl` output is parsed as bounded JSON with timeouts and schema checks.
 - Workspace, window addresses, focus, and layout are checked twice before applying.
 - The atomic Lua guard rechecks the window set, focus, Dwindle layout, split bias, groups, fullscreen state, and horizontal geometry immediately before dispatch. Pseudotile is not treated as a separate policy flag because Hyprland's Lua window API does not expose it; the same geometry eligibility applies.
 - The resulting geometry is read back and verified.
-- A lightweight Omarchy QML service reacts to relevant Hyprland events with a 140 ms debounce; there is no polling, privileged command, network access, or user configuration write.
+- A lightweight Omarchy QML service reacts to relevant Hyprland events with a 140 ms debounce and one in-flight request. Transient failures retry after 250, 500, and 1000 ms, then stop; there is no polling, privileged command, network access, or user configuration write.
 
 ## Development
 
 ```bash
 python -m unittest discover -s tests -v
 omarchy plugin validate .
-qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml PaneRatioService.qml
+qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml PaneRatioProtocol.qml ReconcileScheduler.qml PaneRatioService.qml
 ```
 
 ## License

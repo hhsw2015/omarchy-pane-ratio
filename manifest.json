@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.r404r.pane-ratio",
   "name": "Pane Ratio",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "author": "r404r",
   "license": "MIT",
   "description": "Control workspace layouts, save ratios, and switch a safe two-pane split.",

@@ -14,12 +14,15 @@ Panel {
   property var hostWidget: null
   property int focusIndex: 1
   property int workspaceId: 0
+  property string workspaceKind: "unknown"
+  property string workspaceName: ""
   property int tiledWindows: 0
   property string layoutName: "unknown"
   property string orientation: "unknown"
   property string currentRatio: ""
   property string intentRatio: ""
   property string intentState: "no_intent"
+  property string reasonCode: "none"
   property bool backendSplitEligible: false
   property bool backendLayoutEligible: false
   property string errorText: ""
@@ -40,29 +43,37 @@ Panel {
   property var presets: ["1:3", "1:2", "1:1", "2:1", "3:1"]
   property var presetShares: [1 / 4, 1 / 3, 1 / 2, 2 / 3, 3 / 4]
   readonly property int maxOutputChars: 16384
-  readonly property string cliPath: Quickshell.env("HOME")
-    + "/.config/omarchy/plugins/io.github.r404r.pane-ratio/bin/pane-ratio"
+  readonly property string cliPath: root.localPath(Qt.resolvedUrl("bin/pane-ratio"))
   readonly property bool busy: statusProcess.running || applyProcess.running || clearProcess.running
     || splitProcess.running || root.statusFinishing || root.applyFinishing
     || layoutProcess.running || root.clearFinishing || root.splitFinishing
     || root.layoutFinishing
   readonly property bool applying: applyProcess.running || root.applyFinishing
-  readonly property bool eligible: errorText === "" && layoutName === "dwindle"
-    && tiledWindows === 2 && orientation === "horizontal"
+  readonly property bool ratioAvailable: !root.busy && root.errorText === ""
+    && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
   readonly property color foreground: Color.popups.text
   readonly property color mutedForeground: Qt.darker(foreground, 1.45)
   readonly property color accent: Color.accent
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
   readonly property int focusTargetCount: root.presets.length + 4
     + (root.intentRatio === "" ? 0 : 1)
-  readonly property bool splitAvailable: !root.busy && root.backendSplitEligible
-  readonly property bool layoutAvailable: !root.busy && root.backendLayoutEligible
+  readonly property bool splitAvailable: !root.busy && root.errorText === ""
+    && root.backendSplitEligible
+  readonly property bool layoutAvailable: !root.busy && root.errorText === ""
+    && root.backendLayoutEligible
   readonly property var relevantEvents: [
     "openwindow", "closewindow", "movewindow", "movewindowv2",
     "changefloatingmode", "fullscreen", "activewindow", "activewindowv2",
     "workspace", "workspacev2", "focusedmon", "focusedmonv2",
-    "togglegroup", "moveintogroup", "moveoutofgroup", "configreloaded"
+    "togglegroup", "moveintogroup", "moveoutofgroup", "renameworkspace",
+    "configreloaded"
   ]
+
+  function localPath(url) {
+    var value = String(url || "")
+    if (value.indexOf("file://") === 0) value = value.substring(7)
+    try { return decodeURIComponent(value) } catch (error) { return value }
+  }
 
   function open() {
     root.controller.show()
@@ -117,7 +128,7 @@ Panel {
   }
 
   function applyRatio(ratio) {
-    if (root.busy || root.presets.indexOf(ratio) < 0) return
+    if (!root.ratioAvailable || root.presets.indexOf(ratio) < 0) return
     root.errorText = ""
     root.statusText = "Applying " + ratio + "…"
     root.pendingRatio = ratio
@@ -159,22 +170,47 @@ Panel {
     layoutProcess.running = true
   }
 
+  function failClosed(message) {
+    root.workspaceId = 0
+    root.workspaceKind = "unknown"
+    root.workspaceName = ""
+    root.layoutName = "unknown"
+    root.tiledWindows = 0
+    root.orientation = "unknown"
+    root.currentRatio = ""
+    root.intentRatio = ""
+    root.intentState = "unknown"
+    root.reasonCode = "internal"
+    root.backendSplitEligible = false
+    root.backendLayoutEligible = false
+    root.errorText = String(message || "Pane Ratio unavailable")
+    root.statusText = "Pane Ratio unavailable"
+  }
+
   function consumeResult(output, overflow, exitCode, applying, requestedRatio) {
     if (overflow) {
-      root.errorText = "Pane Ratio returned too much data."
-      root.statusText = "Pane Ratio unavailable"
+      root.failClosed("Pane Ratio returned too much data.")
+      return false
+    }
+
+    var parsed = protocol.parse(output, overflow)
+    if (!parsed.valid) {
+      root.failClosed(parsed.error)
       return false
     }
 
     try {
-      var state = JSON.parse(output || "{}")
-      root.workspaceId = Number(state.workspace || 0)
+      var state = parsed.payload
+      root.workspaceId = Number(state.workspace.rawId)
+      root.workspaceKind = String(state.workspace.kind || "unknown")
+      root.workspaceName = String(state.workspace.displayName || "")
       root.layoutName = String(state.layout || "unknown")
       root.tiledWindows = Number(state.tiledWindows || 0)
       root.orientation = String(state.orientation || "unknown")
       root.currentRatio = String(state.ratio || "")
       root.intentRatio = String(state.intentRatio || "")
       root.intentState = String(state.state || "unknown")
+      root.reasonCode = String(state.reasonCode || "internal")
       root.backendSplitEligible = state.splitEligible === true
       root.backendLayoutEligible = state.layoutEligible === true
       if (Array.isArray(state.presets) && state.presets.length > 0) {
@@ -190,20 +226,23 @@ Panel {
       }
       if (exitCode !== 0 || state.ok !== true) {
         root.errorText = String(state.message || "The current workspace cannot be adjusted.")
-        root.statusText = "Workspace " + root.workspaceId + " · " + root.layoutName
+        root.statusText = "Workspace " + (root.workspaceName || root.workspaceId)
+          + " · " + root.layoutName
         return false
       }
       root.errorText = ""
-      root.statusText = String(state.message || ("Workspace " + root.workspaceId))
+      root.statusText = String(state.message
+        || ("Workspace " + (root.workspaceName || root.workspaceId)))
       if (applying && root.intentState === "applied")
         root.currentRatio = String(state.ratio || requestedRatio)
       return true
     } catch (error) {
-      root.errorText = "Could not read Pane Ratio status."
-      root.statusText = "Pane Ratio unavailable"
+      root.failClosed("Could not read Pane Ratio status.")
       return false
     }
   }
+
+  PaneRatioProtocol { id: protocol }
 
   function moveFocus(delta) {
     if (root.busy) {
@@ -223,7 +262,7 @@ Panel {
   function focusTargetEnabled(index) {
     if (root.busy) return false
     if (index === 0) return true
-    if (index >= 1 && index <= root.presets.length) return true
+    if (index >= 1 && index <= root.presets.length) return root.ratioAvailable
     if (index === root.presets.length + 1 || index === root.presets.length + 2)
       return root.layoutAvailable
     if (index === root.presets.length + 3) return root.splitAvailable
@@ -465,7 +504,7 @@ Panel {
               required property int index
               readonly property bool selected: root.intentRatio === modelData
               readonly property bool focused: root.focusIndex === index + 1
-              readonly property bool available: !root.busy
+              readonly property bool available: root.ratioAvailable
               width: (content.width - Style.space(16)) / 3
               height: Style.space(78)
               radius: Math.max(4, Style.cornerRadius)
