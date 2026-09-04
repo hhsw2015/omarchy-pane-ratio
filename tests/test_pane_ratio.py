@@ -177,6 +177,26 @@ class ApplyAndEdgeCaseTests(unittest.TestCase):
         self.assertIn('hl.get_config("dwindle.split_bias")', fake.expression)
         self.assertIn("window.group~=nil", fake.expression)
         self.assertIn("left.at.x<right.at.x", fake.expression)
+        self.assertIn(pane_ratio.LUA_NO_SPECIAL_WORKSPACE_GUARD, fake.expression)
+        self.assertLess(
+            fake.expression.index(pane_ratio.LUA_NO_SPECIAL_WORKSPACE_GUARD),
+            fake.expression.index('hl.dispatch(hl.dsp.layout("splitratio'),
+        )
+
+    def test_special_overlay_opening_before_ratio_eval_is_rejected(self):
+        initial = self.snapshot(500, 500)
+        fake = self.FakeHyprctl(
+            [initial, initial],
+            pane_ratio.PaneRatioError("Pane Ratio special workspace active"),
+        )
+
+        with self.assertRaisesRegex(
+            pane_ratio.PaneRatioError, "special workspace active"
+        ):
+            pane_ratio.apply_ratio(fake, "2:1")
+
+        self.assertEqual(fake.call_index, 8)
+        self.assertIn(pane_ratio.LUA_NO_SPECIAL_WORKSPACE_GUARD, fake.expression)
 
     def test_named_workspace_guard_checks_both_transient_id_and_exact_name(self):
         name = 'dev "雪" \\ pane'
@@ -357,6 +377,24 @@ class SplitToggleTests(unittest.TestCase):
             self.assertIn("if #windows~=2", fake.expression)
             self.assertIn("if not horizontal then", fake.expression)
             self.assertNotIn("if not vertical then", fake.expression)
+            self.assertLess(
+                fake.expression.index(pane_ratio.LUA_NO_SPECIAL_WORKSPACE_GUARD),
+                fake.expression.index('hl.dispatch(hl.dsp.layout("togglesplit"))'),
+            )
+
+    def test_special_overlay_opening_before_split_eval_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = pane_ratio.IntentStore(pathlib.Path(directory) / "state")
+            fake = self.FakeHyprctl(
+                [self.horizontal(), self.horizontal()],
+                pane_ratio.PaneRatioError("Pane Ratio special workspace active"),
+            )
+            with self.assertRaisesRegex(
+                pane_ratio.PaneRatioError, "special workspace active"
+            ):
+                pane_ratio.toggle_split(fake, store)
+        self.assertEqual(fake.call_index, 8)
+        self.assertIn(pane_ratio.LUA_NO_SPECIAL_WORKSPACE_GUARD, fake.expression)
 
     def test_vertical_split_toggles_to_horizontal_and_reconciles_intent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -460,6 +498,30 @@ class WorkspaceLayoutTests(unittest.TestCase):
         self.assertIn("workspace.id~=1", fake.expression)
         self.assertIn('workspace.tiled_layout~="dwindle"', fake.expression)
         self.assertIn('layout = "scrolling"', fake.expression)
+        self.assertLess(
+            fake.expression.index(pane_ratio.LUA_NO_SPECIAL_WORKSPACE_GUARD),
+            fake.expression.index("hl.workspace_rule"),
+        )
+
+    def test_special_overlay_opening_before_layout_eval_is_rejected(self):
+        fake = ApplyAndEdgeCaseTests.FakeHyprctl(
+            [self.horizontal(), self.horizontal()],
+            pane_ratio.PaneRatioError("Pane Ratio special workspace active"),
+        )
+        layout_store = self.FakeLayoutStore()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                pane_ratio.PaneRatioError, "special workspace active"
+            ):
+                pane_ratio.set_workspace_layout(
+                    fake,
+                    pane_ratio.IntentStore(pathlib.Path(directory) / "state"),
+                    layout_store,
+                    "scrolling",
+                )
+        self.assertEqual(fake.call_index, 8)
+        self.assertIsNone(layout_store.saved)
+        self.assertIn(pane_ratio.LUA_NO_SPECIAL_WORKSPACE_GUARD, fake.expression)
 
     def test_setting_current_layout_is_idempotent(self):
         fake = ApplyAndEdgeCaseTests.FakeHyprctl([self.horizontal()])
@@ -512,6 +574,11 @@ class WorkspaceLayoutTests(unittest.TestCase):
                 )
         self.assertEqual(len(fake.expressions), 2)
         self.assertIn('layout = "dwindle"', fake.expressions[-1])
+        for expression in fake.expressions:
+            self.assertLess(
+                expression.index(pane_ratio.LUA_NO_SPECIAL_WORKSPACE_GUARD),
+                expression.index("hl.workspace_rule"),
+            )
 
     def test_post_replace_fsync_uncertainty_does_not_rollback_committed_rule(self):
         fake = ApplyAndEdgeCaseTests.FakeHyprctl(

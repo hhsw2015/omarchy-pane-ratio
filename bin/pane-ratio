@@ -56,6 +56,11 @@ MAX_MONITORS = 64
 COMMAND_TIMEOUT_SECONDS = 2.0
 APPLY_TIMEOUT_SECONDS = 5.0
 LOCK_TIMEOUT_SECONDS = 20.0
+LUA_NO_SPECIAL_WORKSPACE_GUARD = (
+    'if type(hl.get_active_special_workspace)~="function" '
+    'or hl.get_active_special_workspace()~=nil then '
+    'error("Pane Ratio special workspace active") end;'
+)
 RATIO_TOLERANCE = 0.035
 MAX_STATE_BYTES = 65536
 MAX_CONFIG_BYTES = 16384
@@ -1274,7 +1279,8 @@ def apply_ratio(
         "math.abs((left.at.x+left.size.x)-right.at.x)<=16 and "
         "overlap>=math.min(left.size.y,right.size.y)*0.9) then "
         "error(\"Pane Ratio orientation changed\") end;"
-        f'hl.dispatch(hl.dsp.layout("splitratio {exact:.6f} exact"))'
+        + LUA_NO_SPECIAL_WORKSPACE_GUARD
+        + f'hl.dispatch(hl.dsp.layout("splitratio {exact:.6f} exact"))'
     )
     hyprctl.eval(expression, deadline=deadline)
     remaining = deadline - time.monotonic()
@@ -1530,7 +1536,10 @@ def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
         "local vertical=top.at.y<bottom.at.y and "
         "math.abs((top.at.y+top.size.y)-bottom.at.y)<=16 and "
         "voverlap>=math.min(top.size.x,bottom.size.x)*0.9;"
-    ) + orientation_guard + 'hl.dispatch(hl.dsp.layout("togglesplit"))'
+    )
+    expression += orientation_guard
+    expression += LUA_NO_SPECIAL_WORKSPACE_GUARD
+    expression += 'hl.dispatch(hl.dsp.layout("togglesplit"))'
     hyprctl.eval(expression, deadline=deadline)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -1605,7 +1614,8 @@ def set_workspace_layout(
         f'if workspace==nil or {_lua_workspace_guard(second.identity)} '
         f'or workspace.tiled_layout~="{second.layout}" then '
         'error("Pane Ratio workspace changed") end;'
-        f'hl.workspace_rule({{ workspace = {lua_string(second.identity.layout_operand())}, layout = "{target}" }})'
+        + LUA_NO_SPECIAL_WORKSPACE_GUARD
+        + f'hl.workspace_rule({{ workspace = {lua_string(second.identity.layout_operand())}, layout = "{target}" }})'
     )
     hyprctl.eval(expression, deadline=deadline)
     remaining = deadline - time.monotonic()
@@ -1638,7 +1648,8 @@ def set_workspace_layout(
             f'if workspace==nil or {_lua_workspace_guard(verified.identity)} '
             f'or workspace.tiled_layout~="{target}" then '
             'error("Pane Ratio workspace changed") end;'
-            f'hl.workspace_rule({{ workspace = {lua_string(verified.identity.layout_operand())}, layout = "{first.layout}" }})'
+            + LUA_NO_SPECIAL_WORKSPACE_GUARD
+            + f'hl.workspace_rule({{ workspace = {lua_string(verified.identity.layout_operand())}, layout = "{first.layout}" }})'
         )
         try:
             hyprctl.eval(rollback, deadline=deadline)
