@@ -15,6 +15,10 @@ import time
 import unittest
 from unittest import mock
 
+# tests/ ships with the plugin, and the shell reloads every plugin service when
+# anything under the plugin directory changes. Loading the CLI below must not
+# leave a bin/__pycache__ behind if these tests are ever run from an install.
+sys.dont_write_bytecode = True
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "bin" / "pane-ratio"
 LOADER = importlib.machinery.SourceFileLoader("pane_ratio", str(SCRIPT))
