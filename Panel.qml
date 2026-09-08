@@ -63,14 +63,20 @@ Panel {
   // live as windows appear and disappear.
   // 'f' = that column takes the full viewport width (colresize 1.0); the
   // strip then scrolls. Numeric weights tile the viewport together.
-  // Only the shapes unique to the Scrolling strip: one card per position
-  // ('f' there, the rest equal) plus the all-full carousel. Weighted column
-  // splits live in the arrangements cards (Dwindle); picking a card
-  // switches the workspace mode automatically, so no mode toggle is shown.
+  // Every Scrolling strip shape: weighted column splits, one full-width
+  // card per position ('f' there, the rest equal), and the all-full
+  // carousel. Picking a card switches the workspace mode automatically.
+  readonly property var colWeightedByCount: ({
+    2: ["1:1", "1:2", "2:1", "1:3", "3:1"],
+    3: ["1:1:1", "1:2:1", "2:1:1", "1:1:2"],
+    4: ["1:1:1:1", "1:2:2:1", "2:1:1:2"],
+    5: ["1:1:1:1:1", "1:1:2:1:1"],
+    6: ["1:1:1:1:1:1"]
+  })
   readonly property var colPresets: {
     var count = root.tiledWindows
     if (count < 2 || count > 6) return []
-    var list = []
+    var list = (root.colWeightedByCount[count] || []).slice()
     // Position cards need >=2 remaining numeric columns: a lone numeric
     // weight normalizes to the whole viewport, collapsing "f:1" into "f:f".
     if (count >= 3)
@@ -957,7 +963,7 @@ Panel {
         Text {
           visible: root.colPresets.length > 0
           width: parent.width
-          text: "Full-width columns · " + root.tiledWindows + " windows · Scrolling"
+          text: "Columns · " + root.tiledWindows + " windows · Scrolling"
             + (root.layoutName === "scrolling" ? " (current)" : "")
           color: root.foreground
           font.family: root.fontFamily
