@@ -195,7 +195,7 @@ Panel {
   readonly property color mutedForeground: Qt.darker(foreground, 1.45)
   readonly property color accent: Color.accent
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-  readonly property int focusTargetCount: root.pairCards.length + 4
+  readonly property int focusTargetCount: root.pairCards.length + 3
     + (root.intentRatio === "" ? 0 : 1)
   readonly property bool splitAvailable: !root.busy && root.errorText === ""
     && root.backendSplitEligible
@@ -434,8 +434,7 @@ Panel {
     if (index >= 1 && index <= root.pairCards.length) return root.ratioAvailable
     if (index === root.pairCards.length + 1 || index === root.pairCards.length + 2)
       return root.layoutAvailable
-    if (index === root.pairCards.length + 3) return root.splitAvailable
-    return index === root.pairCards.length + 4 && root.intentRatio !== ""
+    return index === root.pairCards.length + 3 && root.intentRatio !== ""
   }
 
   function activateFocused() {
@@ -444,7 +443,6 @@ Panel {
       root.applyPair(root.pairCards[root.focusIndex - 1])
     else if (root.focusIndex === root.pairCards.length + 1) root.setWorkspaceLayout("dwindle")
     else if (root.focusIndex === root.pairCards.length + 2) root.setWorkspaceLayout("scrolling")
-    else if (root.focusIndex === root.pairCards.length + 3) root.toggleSplit()
     else root.clearIntent()
   }
 
@@ -620,7 +618,6 @@ Panel {
           if (index < root.pairCards.length) root.applyPair(root.pairCards[index])
         }
         else if (text === "d" || text === "D") root.clearIntent()
-        else if (text === "s" || text === "S") root.toggleSplit()
         else if (text === "l" || text === "L") root.toggleWorkspaceLayout()
       }
 
@@ -1010,37 +1007,18 @@ Panel {
         }
 
         Button {
-          visible: root.layoutName === "dwindle"
-          width: parent.width
-          text: root.orientation === "vertical"
-            ? "Switch to left ↔ right"
-            : "Switch to top ↕ bottom"
-          tooltipText: "Toggle the two-pane Dwindle split (S)"
-          bordered: true
-          focusable: true
-          hasCursor: root.focusIndex === root.pairCards.length + 3
-          enabled: root.splitAvailable
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          onClicked: root.toggleSplit()
-          onHovered: function(hovered) {
-            if (hovered) root.focusIndex = root.pairCards.length + 3
-          }
-        }
-
-        Button {
           visible: root.layoutName === "dwindle" || root.intentRatio !== ""
           width: parent.width
           text: root.intentRatio === "" ? "No saved workspace rule" : "Forget " + root.intentRatio + " for this workspace"
           tooltipText: "Remove saved ratio (D)"
           bordered: true
           focusable: true
-          hasCursor: root.focusIndex === root.pairCards.length + 4
+          hasCursor: root.focusIndex === root.pairCards.length + 3
           enabled: !root.busy && root.intentRatio !== ""
           foreground: root.foreground
           fontFamily: root.fontFamily
           onClicked: root.clearIntent()
-          onHovered: function(hovered) { if (hovered) root.focusIndex = root.pairCards.length + 4 }
+          onHovered: function(hovered) { if (hovered) root.focusIndex = root.pairCards.length + 3 }
         }
 
         Text {
@@ -1068,7 +1046,7 @@ Panel {
         Text {
           width: parent.width
           text: (root.layoutName === "dwindle"
-              ? "Keys 1–9 pick arrangements · S split"
+              ? "Keys 1–9 pick arrangements"
                 + (root.intentRatio === "" ? "" : " · D forget")
               : "Click a column preset to size the strip")
             + " · L layout · R refresh"
