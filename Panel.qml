@@ -195,7 +195,7 @@ Panel {
   readonly property color mutedForeground: Qt.darker(foreground, 1.45)
   readonly property color accent: Color.accent
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-  readonly property int focusTargetCount: root.presets.length + 4
+  readonly property int focusTargetCount: root.pairCards.length + 4
     + (root.intentRatio === "" ? 0 : 1)
   readonly property bool splitAvailable: !root.busy && root.errorText === ""
     && root.backendSplitEligible
@@ -267,28 +267,42 @@ Panel {
     statusProcess.running = true
   }
 
-  // Two tiled windows stacked top/bottom: the ratio section follows the
-  // pair's orientation instead of always claiming left:right.
   readonly property bool pairVertical: root.orientation === "vertical"
     && root.tiledWindows === 2
 
-  function applyRatio(ratio) {
-    if (!root.ratioAvailable || root.presets.indexOf(ratio) < 0) return
+  // Unified two-pane cards: every ratio in both orientations, one grid.
+  // Clicking a card matching the pair's current orientation keeps the
+  // intent-store path (saved rule + auto-reapply, horizontal only); any
+  // other card reshapes directly via tree apply.
+  readonly property var pairCards: {
+    var cards = []
+    for (var h = 0; h < root.presets.length; h++)
+      cards.push({ ratio: root.presets[h], share: root.presetShares[h], vertical: false })
+    for (var v = 0; v < root.presets.length; v++)
+      cards.push({ ratio: root.presets[v], share: root.presetShares[v], vertical: true })
+    return cards
+  }
+
+  function applyPair(card) {
+    if (!root.ratioAvailable) return
     root.errorText = ""
-    root.statusText = "Applying " + ratio + "…"
-    if (root.pairVertical) {
-      // Vertical pairs go through tree apply (direct, no saved intent —
-      // the intent store's auto-reapply is horizontal-only by design).
-      // Custom presets with double-digit sides fall outside TREE_SPEC_RE
-      // and are rejected by the backend with a visible message.
-      root.pendingTree = "v:" + ratio.replace(":", "-")
+    root.statusText = "Applying " + card.ratio + "…"
+    if (!card.vertical && !root.pairVertical && root.tiledWindows === 2) {
+      root.pendingRatio = card.ratio
       root.resetOutput(true)
-      treeProcess.running = true
+      applyProcess.running = true
       return
     }
-    root.pendingRatio = ratio
+    // Direct reshape. Custom presets with double-digit sides fall outside
+    // TREE_SPEC_RE and are rejected by the backend with a visible message.
+    root.pendingTree = (card.vertical ? "v:" : "h:") + card.ratio.replace(":", "-")
     root.resetOutput(true)
-    applyProcess.running = true
+    treeProcess.running = true
+  }
+
+  function applyRatio(ratio) {
+    if (root.presets.indexOf(ratio) < 0) return
+    root.applyPair({ ratio: ratio, share: 0.5, vertical: root.pairVertical })
   }
 
   function clearIntent() {
@@ -417,20 +431,20 @@ Panel {
   function focusTargetEnabled(index) {
     if (root.busy) return false
     if (index === 0) return true
-    if (index >= 1 && index <= root.presets.length) return root.ratioAvailable
-    if (index === root.presets.length + 1 || index === root.presets.length + 2)
+    if (index >= 1 && index <= root.pairCards.length) return root.ratioAvailable
+    if (index === root.pairCards.length + 1 || index === root.pairCards.length + 2)
       return root.layoutAvailable
-    if (index === root.presets.length + 3) return root.splitAvailable
-    return index === root.presets.length + 4 && root.intentRatio !== ""
+    if (index === root.pairCards.length + 3) return root.splitAvailable
+    return index === root.pairCards.length + 4 && root.intentRatio !== ""
   }
 
   function activateFocused() {
     if (root.focusIndex === 0) root.refresh()
-    else if (root.focusIndex <= root.presets.length)
-      root.applyRatio(root.presets[root.focusIndex - 1])
-    else if (root.focusIndex === root.presets.length + 1) root.setWorkspaceLayout("dwindle")
-    else if (root.focusIndex === root.presets.length + 2) root.setWorkspaceLayout("scrolling")
-    else if (root.focusIndex === root.presets.length + 3) root.toggleSplit()
+    else if (root.focusIndex <= root.pairCards.length)
+      root.applyPair(root.pairCards[root.focusIndex - 1])
+    else if (root.focusIndex === root.pairCards.length + 1) root.setWorkspaceLayout("dwindle")
+    else if (root.focusIndex === root.pairCards.length + 2) root.setWorkspaceLayout("scrolling")
+    else if (root.focusIndex === root.pairCards.length + 3) root.toggleSplit()
     else root.clearIntent()
   }
 
@@ -603,7 +617,7 @@ Panel {
         if (text === "r" || text === "R") root.refresh()
         else if (/^[1-9]$/.test(text)) {
           var index = Number(text) - 1
-          if (index < root.presets.length) root.applyRatio(root.presets[index])
+          if (index < root.pairCards.length) root.applyPair(root.pairCards[index])
         }
         else if (text === "d" || text === "D") root.clearIntent()
         else if (text === "s" || text === "S") root.toggleSplit()
@@ -675,9 +689,7 @@ Panel {
         Text {
           visible: root.layoutName === "dwindle" && root.tiledWindows <= 2
           width: parent.width
-          text: root.pairVertical
-            ? "Choose a top : bottom ratio"
-            : "Choose a left : right ratio"
+          text: "Arrangements · 2 windows"
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
@@ -687,21 +699,24 @@ Panel {
         Grid {
           visible: root.layoutName === "dwindle" && root.tiledWindows <= 2
           width: parent.width
-          columns: 3
+          columns: 5
           spacing: Style.space(8)
 
           Repeater {
-            model: root.presets
+            model: root.pairCards
 
             Rectangle {
               id: presetCard
-              required property string modelData
+              required property var modelData
               required property int index
-              readonly property bool selected: root.intentRatio === modelData
+              // Saved-rule highlight only applies to the horizontal cards:
+              // the intent store is horizontal-only.
+              readonly property bool selected: !modelData.vertical
+                && root.intentRatio === modelData.ratio
               readonly property bool focused: root.focusIndex === index + 1
               readonly property bool available: root.ratioAvailable
-              width: (content.width - Style.space(16)) / 3
-              height: Style.space(78)
+              width: (content.width - Style.space(32)) / 5
+              height: Style.space(64)
               radius: Math.max(4, Style.cornerRadius)
               color: selected
                 ? Util.alpha(root.accent, 0.16)
@@ -710,20 +725,19 @@ Panel {
               border.color: selected ? root.accent : Util.alpha(root.foreground, 0.42)
               opacity: available ? 1 : 0.48
               Accessible.role: Accessible.Button
-              Accessible.name: modelData + (root.pairVertical ? " top to bottom" : " left to right")
-              Accessible.description: selected ? "Saved workspace rule" : "Save workspace rule"
-              Accessible.onPressAction: root.applyRatio(modelData)
+              Accessible.name: modelData.ratio
+                + (modelData.vertical ? " top to bottom" : " left to right")
+              Accessible.description: selected ? "Saved workspace rule" : "Apply arrangement"
+              Accessible.onPressAction: root.applyPair(modelData)
 
               Column {
                 anchors.centerIn: parent
-                spacing: Style.space(6)
+                spacing: Style.space(4)
 
                 Rectangle {
-                  width: root.pairVertical
-                    ? Style.space(40)
-                    : Math.max(Style.space(38),
-                        Math.min(Style.space(64), presetCard.width - Style.space(16)))
-                  height: root.pairVertical ? Style.space(30) : Style.space(24)
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  width: Style.space(34)
+                  height: Style.space(24)
                   radius: Math.max(3, Style.cornerRadius - 1)
                   color: "transparent"
                   border.width: 1
@@ -732,14 +746,14 @@ Panel {
                     : Util.alpha(root.foreground, 0.58)
 
                   Rectangle {
-                    x: Style.space(3)
-                    y: Style.space(3)
-                    width: root.pairVertical
-                      ? parent.width - Style.space(6)
-                      : (parent.width - Style.space(8)) * root.presetShares[presetCard.index]
-                    height: root.pairVertical
-                      ? (parent.height - Style.space(8)) * root.presetShares[presetCard.index]
-                      : parent.height - Style.space(6)
+                    x: Style.space(2)
+                    y: Style.space(2)
+                    width: presetCard.modelData.vertical
+                      ? parent.width - Style.space(4)
+                      : (parent.width - Style.space(6)) * presetCard.modelData.share
+                    height: presetCard.modelData.vertical
+                      ? (parent.height - Style.space(6)) * presetCard.modelData.share
+                      : parent.height - Style.space(4)
                     radius: Math.max(2, Style.cornerRadius - 2)
                     color: presetCard.selected
                       ? root.accent
@@ -748,18 +762,17 @@ Panel {
 
                   Rectangle {
                     anchors.right: parent.right
-                    anchors.rightMargin: Style.space(3)
-                    anchors.bottom: root.pairVertical ? parent.bottom : undefined
-                    anchors.bottomMargin: root.pairVertical ? Style.space(3) : 0
-                    y: root.pairVertical ? 0 : Style.space(3)
-                    width: root.pairVertical
-                      ? parent.width - Style.space(6)
-                      : (parent.width - Style.space(8))
-                        * (1 - root.presetShares[presetCard.index])
-                    height: root.pairVertical
-                      ? (parent.height - Style.space(8))
-                        * (1 - root.presetShares[presetCard.index])
-                      : parent.height - Style.space(6)
+                    anchors.rightMargin: Style.space(2)
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: Style.space(2)
+                    width: presetCard.modelData.vertical
+                      ? parent.width - Style.space(4)
+                      : (parent.width - Style.space(6))
+                        * (1 - presetCard.modelData.share)
+                    height: presetCard.modelData.vertical
+                      ? (parent.height - Style.space(6))
+                        * (1 - presetCard.modelData.share)
+                      : parent.height - Style.space(4)
                     radius: Math.max(2, Style.cornerRadius - 2)
                     color: presetCard.selected
                       ? Util.alpha(root.accent, 0.52)
@@ -769,26 +782,13 @@ Panel {
 
                 Text {
                   anchors.horizontalCenter: parent.horizontalCenter
-                  width: presetCard.width - Style.space(12)
-                  text: presetCard.modelData
+                  text: presetCard.modelData.ratio
                   textFormat: Text.PlainText
                   color: presetCard.selected ? root.accent : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: presetCard.selected
-                  horizontalAlignment: Text.AlignHCenter
-                  elide: Text.ElideRight
                 }
-              }
-
-              Text {
-                anchors.top: parent.top
-                anchors.right: parent.right
-                anchors.margins: Style.space(5)
-                text: String(index + 1)
-                color: root.mutedForeground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
               }
 
               MouseArea {
@@ -796,7 +796,7 @@ Panel {
                 enabled: presetCard.available
                 hoverEnabled: true
                 cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                onClicked: root.applyRatio(presetCard.modelData)
+                onClicked: root.applyPair(presetCard.modelData)
                 onEntered: root.focusIndex = presetCard.index + 1
               }
             }
@@ -982,13 +982,13 @@ Panel {
             tooltipText: "Recursive tiling with ratio and split controls"
             bordered: root.layoutName !== "dwindle"
             focusable: true
-            hasCursor: root.focusIndex === root.presets.length + 1
+            hasCursor: root.focusIndex === root.pairCards.length + 1
             enabled: root.layoutAvailable
             foreground: root.layoutName === "dwindle" ? root.accent : root.foreground
             fontFamily: root.fontFamily
             onClicked: root.setWorkspaceLayout("dwindle")
             onHovered: function(hovered) {
-              if (hovered) root.focusIndex = root.presets.length + 1
+              if (hovered) root.focusIndex = root.pairCards.length + 1
             }
           }
 
@@ -998,13 +998,13 @@ Panel {
             tooltipText: "Horizontal columns with a movable viewport"
             bordered: root.layoutName !== "scrolling"
             focusable: true
-            hasCursor: root.focusIndex === root.presets.length + 2
+            hasCursor: root.focusIndex === root.pairCards.length + 2
             enabled: root.layoutAvailable
             foreground: root.layoutName === "scrolling" ? root.accent : root.foreground
             fontFamily: root.fontFamily
             onClicked: root.setWorkspaceLayout("scrolling")
             onHovered: function(hovered) {
-              if (hovered) root.focusIndex = root.presets.length + 2
+              if (hovered) root.focusIndex = root.pairCards.length + 2
             }
           }
         }
@@ -1018,13 +1018,13 @@ Panel {
           tooltipText: "Toggle the two-pane Dwindle split (S)"
           bordered: true
           focusable: true
-          hasCursor: root.focusIndex === root.presets.length + 3
+          hasCursor: root.focusIndex === root.pairCards.length + 3
           enabled: root.splitAvailable
           foreground: root.foreground
           fontFamily: root.fontFamily
           onClicked: root.toggleSplit()
           onHovered: function(hovered) {
-            if (hovered) root.focusIndex = root.presets.length + 3
+            if (hovered) root.focusIndex = root.pairCards.length + 3
           }
         }
 
@@ -1035,12 +1035,12 @@ Panel {
           tooltipText: "Remove saved ratio (D)"
           bordered: true
           focusable: true
-          hasCursor: root.focusIndex === root.presets.length + 4
+          hasCursor: root.focusIndex === root.pairCards.length + 4
           enabled: !root.busy && root.intentRatio !== ""
           foreground: root.foreground
           fontFamily: root.fontFamily
           onClicked: root.clearIntent()
-          onHovered: function(hovered) { if (hovered) root.focusIndex = root.presets.length + 4 }
+          onHovered: function(hovered) { if (hovered) root.focusIndex = root.pairCards.length + 4 }
         }
 
         Text {
@@ -1068,7 +1068,7 @@ Panel {
         Text {
           width: parent.width
           text: (root.layoutName === "dwindle"
-              ? "Keys 1–" + root.presets.length + " choose ratios · S split"
+              ? "Keys 1–9 pick arrangements · S split"
                 + (root.intentRatio === "" ? "" : " · D forget")
               : "Click a column preset to size the strip")
             + " · L layout · R refresh"
