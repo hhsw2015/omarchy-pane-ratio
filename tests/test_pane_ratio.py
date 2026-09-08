@@ -1313,3 +1313,31 @@ class ReconcileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpecParsingTests(unittest.TestCase):
+    def test_cols_spec_accepts_two_to_six_weights(self):
+        self.assertEqual(pane_ratio._parse_cols_spec("1:2"), [1, 2])
+        self.assertEqual(
+            pane_ratio._parse_cols_spec("1:1:2:1:1:1"), [1, 1, 2, 1, 1, 1]
+        )
+
+    def test_cols_spec_rejects_bad_input(self):
+        for spec in ("1", "0:1", "21:1", "1:2:3:4:5:6:7", "x;rm", "1:-2", ""):
+            with self.assertRaises(pane_ratio.PaneRatioError):
+                pane_ratio._parse_cols_spec(spec)
+
+    def test_tree_spec_shapes(self):
+        valid = ("1-1:h", "2-1:v", "1-1:hv:1-1", "1-2:hh:2-1", "1-1:vh:1-1", "1-2:vv:1-1")
+        for spec in valid:
+            self.assertIsNotNone(pane_ratio.TREE_SPEC_RE.fullmatch(spec), spec)
+        invalid = ("1-1", "1-1:z", "1-1:hvv:1-1", "1-1:hv", "1-1:h:1-1", "0-1:h", "1-1:hv:0-1", "a-1:h")
+        for spec in invalid:
+            self.assertIsNone(pane_ratio.TREE_SPEC_RE.fullmatch(spec), spec)
+
+    def test_share_to_splitratio_matches_live_semantics(self):
+        # Verified live: splitratio 0.666667 exact -> first child 1/3,
+        # 1.333333 -> 2/3.
+        self.assertAlmostEqual(pane_ratio._share_to_splitratio(1, 2), 0.666667, places=5)
+        self.assertAlmostEqual(pane_ratio._share_to_splitratio(2, 1), 1.333333, places=5)
+        self.assertAlmostEqual(pane_ratio._share_to_splitratio(1, 1), 1.0, places=6)

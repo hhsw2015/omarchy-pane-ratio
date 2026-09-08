@@ -1578,6 +1578,134 @@ def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutStat
     )
 
 
+# Dwindle tree presets. Each spec drives the focused-node splitratio of
+# every window in reading order (sorted by x, then y). Format:
+#   <outer>:<axes>[:<inner>]
+#   outer - first-child share of the root split as N-M (e.g. 1-1, 2-1)
+#   axes  - root axis, h (side by side) or v (stacked); with 3 windows a
+#           second char gives the nested pair's axis (hv = main + stack,
+#           hh = three columns, vh = main on top + pair below, vv = rows)
+#   inner - 3 windows: share of the nested pair's first child as N-M
+# Only shapes verified against live Hyprland: root split + one nested pair.
+TREE_SPEC_RE = re.compile(r"^[1-9]-[1-9]:([hv]|[hv][hv]:[1-9]-[1-9])$")
+
+
+def _share_to_splitratio(first: int, second: int) -> float:
+    # splitratio X exact gives the focused node's first child X/2 of the
+    # space (verified live: 0.666667 -> 1/3, 1.333333 -> 2/3).
+    return 2.0 * first / (first + second)
+
+
+def apply_tree(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
+    """Dwindle: shape the 2- or 3-window tree to a preset.
+
+    Windows are addressed in reading order (x, then y). The root node ratio
+    is set through the first window, the nested pair (3 windows) through the
+    window that shares the root's second slot. Axis mismatches are fixed with
+    togglesplit on the relevant node before sizing.
+    """
+    if not TREE_SPEC_RE.fullmatch(spec):
+        raise PaneRatioError(
+            "unsupported tree preset", reason_code="unsupported_ratio"
+        )
+    parts = spec.split(":")
+    outer = [int(piece) for piece in parts[0].split("-")]
+    axis = parts[1][0]
+    inner_axis = parts[1][1] if len(parts[1]) == 2 else None
+    inner = [int(piece) for piece in parts[2].split("-")] if len(parts) == 3 else None
+    expected_windows = 3 if inner is not None else 2
+    deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
+    first = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if not first.identity.supported:
+        return first
+    if first.layout != "dwindle":
+        return first.with_intent(
+            first.intent_ratio,
+            "paused_mode",
+            "Tree presets apply to the Dwindle layout only.",
+            "unsupported_layout",
+        )
+    if first.tiled_windows != expected_windows:
+        return first.with_intent(
+            first.intent_ratio,
+            "paused_mode",
+            f"This preset needs {expected_windows} tiled windows; found {first.tiled_windows}.",
+            "topology",
+        )
+    outer_ratio = _share_to_splitratio(outer[0], outer[1])
+    inner_ratio = (
+        _share_to_splitratio(inner[0], inner[1]) if inner is not None else None
+    )
+    want_horizontal = "true" if axis == "h" else "false"
+    expression = (
+        "local workspace=hl.get_active_workspace();"
+        f"if workspace==nil or {_lua_workspace_guard(first.identity)} "
+        'or workspace.tiled_layout~="dwindle" '
+        'then error("Pane Ratio target changed") end;'
+        + LUA_NO_SPECIAL_WORKSPACE_GUARD
+        + "local windows={};"
+        "for _,window in ipairs(hl.get_workspace_windows(workspace)) do "
+        "if window.mapped and not window.floating then "
+        'if window.fullscreen~=0 then error("Pane Ratio fullscreen changed") end;'
+        "table.insert(windows,window) end end;"
+        f'if #windows~={expected_windows} then error("Pane Ratio windows changed") end;'
+        "table.sort(windows,function(a,b) "
+        "return a.at.x<b.at.x or (a.at.x==b.at.x and a.at.y<b.at.y) end);"
+        "local previous=hl.get_active_window();"
+        # Root axis: compare window 1 and the last window. Side-by-side root
+        # means their x ranges do not overlap.
+        "local head=windows[1];local tail=windows[#windows];"
+        "local horizontal=(head.at.x+head.size.x)<=tail.at.x;"
+        f"if horizontal~={want_horizontal} then "
+        "hl.dispatch(hl.dsp.focus({ window = head }));"
+        'hl.dispatch(hl.dsp.layout("togglesplit"));'
+        "end;"
+        "hl.dispatch(hl.dsp.focus({ window = windows[1] }));"
+        f'hl.dispatch(hl.dsp.layout("splitratio {outer_ratio:.6f} exact"));'
+    )
+    if inner_ratio is not None:
+        want_inner_horizontal = "true" if inner_axis == "h" else "false"
+        expression += (
+            # Nested pair axis: windows 2 and 3 sit side by side when their
+            # x ranges do not overlap. togglesplit on window 2 flips only
+            # that node.
+            "local mid=windows[2];local last=windows[3];"
+            "local inner_horizontal=(mid.at.x+mid.size.x)<=last.at.x "
+            "or (last.at.x+last.size.x)<=mid.at.x;"
+            f"if inner_horizontal~={want_inner_horizontal} then "
+            "hl.dispatch(hl.dsp.focus({ window = mid }));"
+            'hl.dispatch(hl.dsp.layout("togglesplit"));'
+            "end;"
+            "hl.dispatch(hl.dsp.focus({ window = windows[2] }));"
+            f'hl.dispatch(hl.dsp.layout("splitratio {inner_ratio:.6f} exact"));'
+        )
+    expression += (
+        "if previous~=nil then hl.dispatch(hl.dsp.focus({ window = previous })) end"
+    )
+    hyprctl.eval(expression, deadline=deadline)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TransientPaneRatioError(
+            "Pane Ratio operation timed out", reason_code="operation_timeout"
+        )
+    time.sleep(min(0.08, remaining))
+    verified = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if (
+        not _same_workspace(verified.identity, first.identity)
+        or verified.tiled_windows != first.tiled_windows
+    ):
+        raise TransientPaneRatioError(
+            "workspace windows changed before the tree could be verified",
+            reason_code="target_changed",
+        )
+    return verified.with_intent(
+        verified.intent_ratio,
+        "applied",
+        f"Tree shaped {spec}.",
+        "applied",
+    )
+
+
 def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
     first = read_state(hyprctl, deadline=deadline, presets=store.presets)
@@ -1846,6 +1974,8 @@ def _operation(arguments: list[str]) -> str:
         return "apply"
     if arguments[:2] == ["cols", "apply"]:
         return "cols_apply"
+    if arguments[:2] == ["tree", "apply"]:
+        return "tree_apply"
     return "unknown"
 
 
@@ -1937,8 +2067,13 @@ def execute(
         success = state.phase == "applied"
         emit(state.public(operation, ok=success, presets=presets))
         return 0 if success else 2
+    if len(arguments) == 3 and arguments[:2] == ["tree", "apply"]:
+        state = apply_tree(hyprctl, store, arguments[2])
+        success = state.phase == "applied"
+        emit(state.public(operation, ok=success, presets=presets))
+        return 0 if success else 2
     raise PaneRatioError(
-        "usage: pane-ratio status | reconcile | reconcile-background | intent set PRESET | intent clear | split toggle | layout set dwindle|scrolling | layout toggle | cols apply W:W[:W...]"
+        "usage: pane-ratio status | reconcile | reconcile-background | intent set PRESET | intent clear | split toggle | layout set dwindle|scrolling | layout toggle | cols apply W:W[:W...] | tree apply N-M:AXES[:N-M]"
     )
 
 

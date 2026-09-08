@@ -81,12 +81,97 @@ Panel {
     root.resetOutput(true)
     colsProcess.running = true
   }
+
+  property string pendingTree: ""
+  property bool treeFinishing: false
+
+  // Dwindle tree presets, keyed by tiled-window count. Two windows get the
+  // vertical ratios (the horizontal ones are the intent cards above); three
+  // windows get every root+nested shape the backend can build.
+  readonly property var treePresetsByCount: ({
+    2: [
+      { spec: "1-1:v", label: "1:1 rows" },
+      { spec: "1-2:v", label: "1:2 rows" },
+      { spec: "2-1:v", label: "2:1 rows" }
+    ],
+    3: [
+      { spec: "2-1:hv:1-1", label: "Main left" },
+      { spec: "1-1:hv:1-1", label: "Half + stack" },
+      { spec: "1-2:hh:1-1", label: "3 columns" },
+      { spec: "1-1:hh:1-1", label: "½ + 2 cols" },
+      { spec: "2-1:vh:1-1", label: "Main top" },
+      { spec: "1-1:vh:1-1", label: "½ + 2 below" },
+      { spec: "1-2:vv:1-1", label: "3 rows" }
+    ]
+  })
+  readonly property var treePresets: root.layoutName === "dwindle"
+    ? (root.treePresetsByCount[root.tiledWindows] || []) : []
+  readonly property bool treeAvailable: !root.busy && root.treePresets.length > 0
+    && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
+
+  // Unit-space rectangles {x,y,w,h in 0..1} describing a tree spec, for the
+  // preset card thumbnails.
+  function treeRects(spec) {
+    var parts = String(spec).split(":")
+    var outer = parts[0].split("-")
+    var oShare = Number(outer[0]) / (Number(outer[0]) + Number(outer[1]))
+    var axes = parts[1]
+    var rects = []
+    if (parts.length < 3) {
+      if (axes === "h") {
+        rects.push({ x: 0, y: 0, w: oShare, h: 1 })
+        rects.push({ x: oShare, y: 0, w: 1 - oShare, h: 1 })
+      } else {
+        rects.push({ x: 0, y: 0, w: 1, h: oShare })
+        rects.push({ x: 0, y: oShare, w: 1, h: 1 - oShare })
+      }
+      return rects
+    }
+    var inner = parts[2].split("-")
+    var iShare = Number(inner[0]) / (Number(inner[0]) + Number(inner[1]))
+    if (axes[0] === "h") {
+      rects.push({ x: 0, y: 0, w: oShare, h: 1 })
+      if (axes[1] === "v") {
+        rects.push({ x: oShare, y: 0, w: 1 - oShare, h: iShare })
+        rects.push({ x: oShare, y: iShare, w: 1 - oShare, h: 1 - iShare })
+      } else {
+        var innerWidth = (1 - oShare) * iShare
+        rects.push({ x: oShare, y: 0, w: innerWidth, h: 1 })
+        rects.push({ x: oShare + innerWidth, y: 0, w: 1 - oShare - innerWidth, h: 1 })
+      }
+    } else {
+      rects.push({ x: 0, y: 0, w: 1, h: oShare })
+      if (axes[1] === "h") {
+        rects.push({ x: 0, y: oShare, w: iShare, h: 1 - oShare })
+        rects.push({ x: iShare, y: oShare, w: 1 - iShare, h: 1 - oShare })
+      } else {
+        var innerHeight = (1 - oShare) * iShare
+        rects.push({ x: 0, y: oShare, w: 1, h: innerHeight })
+        rects.push({ x: 0, y: oShare + innerHeight, w: 1, h: 1 - oShare - innerHeight })
+      }
+    }
+    return rects
+  }
+
+  function applyTree(spec) {
+    if (!root.treeAvailable) return
+    var known = false
+    for (var index = 0; index < root.treePresets.length; index++)
+      if (root.treePresets[index].spec === spec) known = true
+    if (!known) return
+    root.errorText = ""
+    root.statusText = "Shaping layout…"
+    root.pendingTree = spec
+    root.resetOutput(true)
+    treeProcess.running = true
+  }
   readonly property int maxOutputChars: 16384
   readonly property string cliPath: root.localPath(Qt.resolvedUrl("bin/pane-ratio"))
   readonly property bool busy: statusProcess.running || applyProcess.running || clearProcess.running
     || splitProcess.running || root.statusFinishing || root.applyFinishing
     || layoutProcess.running || root.clearFinishing || root.splitFinishing
     || root.layoutFinishing || colsProcess.running || root.colsFinishing
+    || treeProcess.running || root.treeFinishing
   readonly property bool applying: applyProcess.running || root.applyFinishing
   readonly property bool ratioAvailable: !root.busy && root.errorText === ""
     && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
@@ -408,6 +493,24 @@ Panel {
   }
 
   Process {
+    id: treeProcess
+    command: [root.cliPath, "tree", "apply", root.pendingTree]
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) { root.appendOutput(chunk, true) }
+    }
+    stderr: SplitParser { splitMarker: ""; onRead: function(chunk) {} }
+    onExited: function(exitCode) {
+      root.treeFinishing = true
+      Qt.callLater(function() {
+        root.consumeResult(root.applyOutput, root.applyOutputOverflow, exitCode, true, "")
+        root.treeFinishing = false
+        if (root.refreshPending) Qt.callLater(root.refresh)
+      })
+    }
+  }
+
+  Process {
     id: colsProcess
     command: [root.cliPath, "cols", "apply", root.pendingCols]
     stdout: SplitParser {
@@ -539,6 +642,7 @@ Panel {
         }
 
         Text {
+          visible: root.layoutName === "dwindle"
           width: parent.width
           text: "Choose a left : right ratio"
           color: root.foreground
@@ -548,6 +652,7 @@ Panel {
         }
 
         Grid {
+          visible: root.layoutName === "dwindle"
           width: parent.width
           columns: 3
           spacing: Style.space(8)
@@ -647,6 +752,84 @@ Panel {
                 cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                 onClicked: root.applyRatio(presetCard.modelData)
                 onEntered: root.focusIndex = presetCard.index + 1
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: root.layoutName === "dwindle" && root.treePresets.length > 0
+          width: parent.width
+          text: "Arrangements · " + root.tiledWindows + " windows"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.subtitle
+          font.bold: true
+        }
+
+        Grid {
+          visible: root.layoutName === "dwindle" && root.treePresets.length > 0
+          width: parent.width
+          columns: 3
+          spacing: Style.space(8)
+
+          Repeater {
+            model: root.treePresets
+
+            Rectangle {
+              id: treeCard
+              required property var modelData
+              readonly property var rects: root.treeRects(modelData.spec)
+              readonly property bool available: root.treeAvailable
+              width: (content.width - Style.space(16)) / 3
+              height: Style.space(64)
+              radius: Math.max(4, Style.cornerRadius)
+              color: Util.alpha(root.foreground, 0.035)
+              opacity: available ? 1 : 0.48
+              Accessible.role: Accessible.Button
+              Accessible.name: modelData.label
+              Accessible.onPressAction: root.applyTree(modelData.spec)
+
+              Column {
+                anchors.centerIn: parent
+                spacing: Style.space(4)
+
+                Item {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  width: Style.space(44)
+                  height: Style.space(26)
+
+                  Repeater {
+                    model: treeCard.rects
+
+                    Rectangle {
+                      required property var modelData
+                      x: modelData.x * Style.space(44) + 1
+                      y: modelData.y * Style.space(26) + 1
+                      width: Math.max(3, modelData.w * Style.space(44) - 2)
+                      height: Math.max(3, modelData.h * Style.space(26) - 2)
+                      radius: 2
+                      color: Util.alpha(root.foreground, 0.48)
+                    }
+                  }
+                }
+
+                Text {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  text: treeCard.modelData.label
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                enabled: treeCard.available
+                hoverEnabled: true
+                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: root.applyTree(treeCard.modelData.spec)
               }
             }
           }
@@ -781,6 +964,7 @@ Panel {
         }
 
         Button {
+          visible: root.layoutName === "dwindle"
           width: parent.width
           text: root.orientation === "vertical"
             ? "Switch to left ↔ right"
@@ -799,6 +983,7 @@ Panel {
         }
 
         Button {
+          visible: root.layoutName === "dwindle" || root.intentRatio !== ""
           width: parent.width
           text: root.intentRatio === "" ? "No saved workspace rule" : "Forget " + root.intentRatio + " for this workspace"
           tooltipText: "Remove saved ratio (D)"
@@ -824,7 +1009,7 @@ Panel {
         }
 
         Text {
-          visible: root.errorText === ""
+          visible: root.errorText === "" && root.layoutName === "dwindle"
           width: parent.width
           text: "Saved: " + (root.intentRatio || "None")
             + "   ·   Current: " + (root.currentRatio || "Unavailable")
@@ -836,8 +1021,10 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Keys 1–" + root.presets.length + " choose ratios"
-            + " · S split" + (root.intentRatio === "" ? "" : " · D forget")
+          text: (root.layoutName === "dwindle"
+              ? "Keys 1–" + root.presets.length + " choose ratios · S split"
+                + (root.intentRatio === "" ? "" : " · D forget")
+              : "Click a column preset to size the strip")
             + " · L layout · R refresh"
           color: root.mutedForeground
           font.family: root.fontFamily

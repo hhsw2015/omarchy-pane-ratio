@@ -8,7 +8,7 @@ QtObject {
   readonly property int maxWorkspaceNameChars: 128
   readonly property var operations: [
     "status", "reconcile", "intent_set", "intent_clear", "split_toggle",
-    "layout_set", "layout_toggle", "apply", "cols_apply"
+    "layout_set", "layout_toggle", "apply", "cols_apply", "tree_apply"
   ]
   readonly property var states: [
     "unknown", "no_intent", "eligible", "applied", "waiting_window",
