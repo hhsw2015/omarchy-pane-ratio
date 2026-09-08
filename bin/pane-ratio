@@ -1480,25 +1480,40 @@ def reconcile_background(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
 
 COLS_MAX_WINDOWS = 6
 COLS_WEIGHT_RANGE = (1, 20)
-COLS_SPEC_RE = re.compile(r"^[0-9]{1,2}(:[0-9]{1,2}){0,5}$")
+# Tokens are weights or 'f' (full viewport width, colresize 1.0). Numeric
+# weights are normalized among themselves so the non-full columns still tile
+# the viewport together.
+COLS_SPEC_RE = re.compile(r"^([0-9]{1,2}|f)(:([0-9]{1,2}|f)){1,5}$")
 
 
-def _parse_cols_spec(spec: str) -> list[int]:
+def _parse_cols_spec(spec: str) -> list[float]:
     if not COLS_SPEC_RE.fullmatch(spec):
         raise PaneRatioError(
             "unsupported column preset", reason_code="unsupported_ratio"
         )
-    weights = [int(part) for part in spec.split(":")]
-    if len(weights) < 2 or len(weights) > COLS_MAX_WINDOWS:
+    tokens = spec.split(":")
+    if len(tokens) < 2 or len(tokens) > COLS_MAX_WINDOWS:
         raise PaneRatioError(
             "unsupported column preset", reason_code="unsupported_ratio"
         )
-    for weight in weights:
+    weights: list[int] = []
+    for token in tokens:
+        if token == "f":
+            continue
+        weight = int(token)
         if weight < COLS_WEIGHT_RANGE[0] or weight > COLS_WEIGHT_RANGE[1]:
             raise PaneRatioError(
                 "unsupported column preset", reason_code="unsupported_ratio"
             )
-    return weights
+        weights.append(weight)
+    total = sum(weights)
+    fractions: list[float] = []
+    for token in tokens:
+        if token == "f":
+            fractions.append(1.0)
+        else:
+            fractions.append(int(token) / total)
+    return fractions
 
 
 def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
@@ -1509,7 +1524,7 @@ def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutStat
     and resized with `colresize <fraction>` inside one guarded Lua
     expression; focus returns to the originally focused window.
     """
-    weights = _parse_cols_spec(spec)
+    fractions = _parse_cols_spec(spec)
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
     first = read_state(hyprctl, deadline=deadline, presets=store.presets)
     if not first.identity.supported:
@@ -1521,15 +1536,13 @@ def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutStat
             "Column presets apply to the Scrolling layout only.",
             "unsupported_layout",
         )
-    if first.tiled_windows != len(weights):
+    if first.tiled_windows != len(fractions):
         return first.with_intent(
             first.intent_ratio,
             "paused_mode",
-            f"This preset needs {len(weights)} tiled windows; found {first.tiled_windows}.",
+            f"This preset needs {len(fractions)} tiled windows; found {first.tiled_windows}.",
             "topology",
         )
-    total = sum(weights)
-    fractions = [weight / total for weight in weights]
     fraction_list = ",".join(f"{fraction:.6f}" for fraction in fractions)
     expression = (
         "local workspace=hl.get_active_workspace();"
@@ -1542,7 +1555,7 @@ def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutStat
         "if window.mapped and not window.floating then "
         'if window.fullscreen~=0 then error("Pane Ratio fullscreen changed") end;'
         "table.insert(windows,window) end end;"
-        f'if #windows~={len(weights)} then error("Pane Ratio windows changed") end;'
+        f'if #windows~={len(fractions)} then error("Pane Ratio windows changed") end;'
         "table.sort(windows,function(a,b) return a.at.x<b.at.x end);"
         "for i=2,#windows do if windows[i].at.x<=windows[i-1].at.x then "
         'error("Pane Ratio columns overlap") end end;'
@@ -1578,16 +1591,17 @@ def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutStat
     )
 
 
-# Dwindle tree presets. Each spec drives the focused-node splitratio of
-# every window in reading order (sorted by x, then y). Format:
-#   <outer>:<axes>[:<inner>]
-#   outer - first-child share of the root split as N-M (e.g. 1-1, 2-1)
-#   axes  - root axis, h (side by side) or v (stacked); with 3 windows a
-#           second char gives the nested pair's axis (hv = main + stack,
-#           hh = three columns, vh = main on top + pair below, vv = rows)
-#   inner - 3 windows: share of the nested pair's first child as N-M
-# Only shapes verified against live Hyprland: root split + one nested pair.
-TREE_SPEC_RE = re.compile(r"^[1-9]-[1-9]:([hv]|[hv][hv]:[1-9]-[1-9])$")
+# Dwindle tree presets, generalized to the natural dwindle chain: window k
+# (in reading order x,y) owns split node k, which separates it from windows
+# k+1..n. Spec format:  AXES:R1:R2:...:R(n-1)
+#   AXES - one char per node, h (side by side) or v (stacked)
+#   Rk   - node k first-child share as A-B (window k gets A/(A+B))
+# Example 4-window main left + 3 stacked right: hvv:1-1:1-2:1-1
+# Applied one node at a time with fresh geometry, then the final geometry is
+# verified against the spec; a rearranged (non-chain) tree fails verification
+# and reports an error instead of guessing.
+TREE_SPEC_RE = re.compile(r"^[hv]{1,5}(:[1-9]-[1-9]){1,5}$")
+TREE_VERIFY_TOLERANCE = 0.06
 
 
 def _share_to_splitratio(first: int, second: int) -> float:
@@ -1596,24 +1610,90 @@ def _share_to_splitratio(first: int, second: int) -> float:
     return 2.0 * first / (first + second)
 
 
-def apply_tree(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
-    """Dwindle: shape the 2- or 3-window tree to a preset.
-
-    Windows are addressed in reading order (x, then y). The root node ratio
-    is set through the first window, the nested pair (3 windows) through the
-    window that shares the root's second slot. Axis mismatches are fixed with
-    togglesplit on the relevant node before sizing.
-    """
+def _parse_tree_spec(spec: str) -> tuple[str, list[tuple[int, int]]]:
     if not TREE_SPEC_RE.fullmatch(spec):
         raise PaneRatioError(
             "unsupported tree preset", reason_code="unsupported_ratio"
         )
     parts = spec.split(":")
-    outer = [int(piece) for piece in parts[0].split("-")]
-    axis = parts[1][0]
-    inner_axis = parts[1][1] if len(parts[1]) == 2 else None
-    inner = [int(piece) for piece in parts[2].split("-")] if len(parts) == 3 else None
-    expected_windows = 3 if inner is not None else 2
+    axes = parts[0]
+    ratios = [
+        (int(piece.split("-")[0]), int(piece.split("-")[1])) for piece in parts[1:]
+    ]
+    if len(axes) != len(ratios):
+        raise PaneRatioError(
+            "unsupported tree preset", reason_code="unsupported_ratio"
+        )
+    return axes, ratios
+
+
+def _tree_expected_rects(
+    axes: str, ratios: list[tuple[int, int]]
+) -> list[tuple[float, float, float, float]]:
+    """Unit-space rects for each window of a chain spec, reading order."""
+    rects: list[tuple[float, float, float, float]] = []
+    x, y, w, h = 0.0, 0.0, 1.0, 1.0
+    for axis, (a, b) in zip(axes, ratios):
+        share = a / (a + b)
+        if axis == "h":
+            rects.append((x, y, w * share, h))
+            x += w * share
+            w *= 1 - share
+        else:
+            rects.append((x, y, w, h * share))
+            y += h * share
+            h *= 1 - share
+    rects.append((x, y, w, h))
+    return rects
+
+
+def _reading_order_addresses(
+    hyprctl: Hyprctl, workspace_id: int, expected: int, deadline: float
+) -> list[str]:
+    clients = hyprctl.json(MAX_CLIENTS_BYTES, "clients", deadline=deadline)
+    if not isinstance(clients, list):
+        raise TransientPaneRatioError(
+            "Hyprland client list unavailable", reason_code="target_changed"
+        )
+    entries: list[tuple[int, int, str]] = []
+    for client in clients:
+        if not isinstance(client, dict) or client.get("mapped") is not True:
+            continue
+        client_workspace = client.get("workspace")
+        if (
+            not isinstance(client_workspace, dict)
+            or _integer(client_workspace.get("id")) != workspace_id
+        ):
+            continue
+        if client.get("floating") is not False:
+            continue
+        address = client.get("address")
+        position = _pair(client.get("at"))
+        if not isinstance(address, str) or ADDRESS_RE.fullmatch(address) is None:
+            raise PaneRatioError("a tiled window has an invalid address")
+        if position is None:
+            raise PaneRatioError("a tiled window has invalid geometry")
+        entries.append((position[0], position[1], address))
+    if len(entries) != expected:
+        raise TransientPaneRatioError(
+            "workspace windows changed while reading the order",
+            reason_code="target_changed",
+        )
+    entries.sort()
+    return [address for _x, _y, address in entries]
+
+
+def apply_tree(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
+    """Dwindle: shape the workspace's window chain to a preset (2-6 windows).
+
+    Node k is adjusted through window k: axis mismatches are fixed with
+    togglesplit, then splitratio exact sets the share. Geometry is re-read
+    before every node so earlier toggles cannot skew detection. The final
+    geometry must match the spec within tolerance or the operation reports
+    failure (covers trees the user rearranged away from the chain).
+    """
+    axes, ratios = _parse_tree_spec(spec)
+    expected_windows = len(axes) + 1
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
     first = read_state(hyprctl, deadline=deadline, presets=store.presets)
     if not first.identity.supported:
@@ -1632,12 +1712,8 @@ def apply_tree(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
             f"This preset needs {expected_windows} tiled windows; found {first.tiled_windows}.",
             "topology",
         )
-    outer_ratio = _share_to_splitratio(outer[0], outer[1])
-    inner_ratio = (
-        _share_to_splitratio(inner[0], inner[1]) if inner is not None else None
-    )
-    want_horizontal = "true" if axis == "h" else "false"
-    expression = (
+
+    common_prefix = (
         "local workspace=hl.get_active_workspace();"
         f"if workspace==nil or {_lua_workspace_guard(first.identity)} "
         'or workspace.tiled_layout~="dwindle" '
@@ -1649,40 +1725,46 @@ def apply_tree(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
         'if window.fullscreen~=0 then error("Pane Ratio fullscreen changed") end;'
         "table.insert(windows,window) end end;"
         f'if #windows~={expected_windows} then error("Pane Ratio windows changed") end;'
-        "table.sort(windows,function(a,b) "
-        "return a.at.x<b.at.x or (a.at.x==b.at.x and a.at.y<b.at.y) end);"
-        "local previous=hl.get_active_window();"
-        # Root axis: compare window 1 and the last window. Side-by-side root
-        # means their x ranges do not overlap.
-        "local head=windows[1];local tail=windows[#windows];"
-        "local horizontal=(head.at.x+head.size.x)<=tail.at.x;"
-        f"if horizontal~={want_horizontal} then "
-        "hl.dispatch(hl.dsp.focus({ window = head }));"
-        'hl.dispatch(hl.dsp.layout("togglesplit"));'
-        "end;"
-        "hl.dispatch(hl.dsp.focus({ window = windows[1] }));"
-        f'hl.dispatch(hl.dsp.layout("splitratio {outer_ratio:.6f} exact"));'
     )
-    if inner_ratio is not None:
-        want_inner_horizontal = "true" if inner_axis == "h" else "false"
-        expression += (
-            # Nested pair axis: windows 2 and 3 sit side by side when their
-            # x ranges do not overlap. togglesplit on window 2 flips only
-            # that node.
-            "local mid=windows[2];local last=windows[3];"
-            "local inner_horizontal=(mid.at.x+mid.size.x)<=last.at.x "
-            "or (last.at.x+last.size.x)<=mid.at.x;"
-            f"if inner_horizontal~={want_inner_horizontal} then "
-            "hl.dispatch(hl.dsp.focus({ window = mid }));"
+    addresses = _reading_order_addresses(
+        hyprctl, first.identity.raw_id, expected_windows, deadline
+    )
+    previous_active = first.active_address
+
+    for node_index, (axis, (a, b)) in enumerate(zip(axes, ratios)):
+        ratio_value = _share_to_splitratio(a, b)
+        window_address = addresses[node_index]
+        next_address = addresses[node_index + 1]
+        want_horizontal = "true" if axis == "h" else "false"
+        step = (
+            common_prefix
+            + "local byaddr={};for _,window in ipairs(windows) do "
+            "byaddr[window.address]=window end;"
+            f'local current=byaddr["{window_address}"];'
+            f'local nextwin=byaddr["{next_address}"];'
+            "if current==nil or nextwin==nil then "
+            'error("Pane Ratio windows changed") end;'
+            "local horizontal=(current.at.x+current.size.x)<=nextwin.at.x;"
+            f"if horizontal~={want_horizontal} then "
+            "hl.dispatch(hl.dsp.focus({ window = current }));"
             'hl.dispatch(hl.dsp.layout("togglesplit"));'
             "end;"
-            "hl.dispatch(hl.dsp.focus({ window = windows[2] }));"
-            f'hl.dispatch(hl.dsp.layout("splitratio {inner_ratio:.6f} exact"));'
+            "hl.dispatch(hl.dsp.focus({ window = current }));"
+            f'hl.dispatch(hl.dsp.layout("splitratio {ratio_value:.6f} exact"));'
         )
-    expression += (
-        "if previous~=nil then hl.dispatch(hl.dsp.focus({ window = previous })) end"
-    )
-    hyprctl.eval(expression, deadline=deadline)
+        hyprctl.eval(step, deadline=deadline)
+
+    if previous_active:
+        hyprctl.eval(
+            common_prefix
+            + "local byaddr={};for _,window in ipairs(windows) do "
+            "byaddr[window.address]=window end;"
+            f'local previous=byaddr["{previous_active}"];'
+            "if previous~=nil then "
+            "hl.dispatch(hl.dsp.focus({ window = previous })) end",
+            deadline=deadline,
+        )
+
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TransientPaneRatioError(
@@ -1698,12 +1780,71 @@ def apply_tree(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
             "workspace windows changed before the tree could be verified",
             reason_code="target_changed",
         )
+    geometry_error = _verify_tree_geometry(
+        hyprctl, addresses, axes, ratios, deadline
+    )
+    if geometry_error:
+        return verified.with_intent(
+            verified.intent_ratio,
+            "paused_mode",
+            "This workspace tree cannot take that shape; rearrange the windows first.",
+            "topology",
+        )
     return verified.with_intent(
         verified.intent_ratio,
         "applied",
         f"Tree shaped {spec}.",
         "applied",
     )
+
+
+def _verify_tree_geometry(
+    hyprctl: Hyprctl,
+    addresses: list[str],
+    axes: str,
+    ratios: list[tuple[int, int]],
+    deadline: float,
+) -> str:
+    clients = hyprctl.json(MAX_CLIENTS_BYTES, "clients", deadline=deadline)
+    if not isinstance(clients, list):
+        return "clients unavailable"
+    geometry: dict[str, tuple[float, float, float, float]] = {}
+    for client in clients:
+        if not isinstance(client, dict):
+            continue
+        address = client.get("address")
+        position = _pair(client.get("at"))
+        size = _pair(client.get("size"))
+        if isinstance(address, str) and position and size:
+            geometry[address] = (
+                float(position[0]),
+                float(position[1]),
+                float(size[0]),
+                float(size[1]),
+            )
+    rects = [geometry.get(address) for address in addresses]
+    if any(rect is None for rect in rects):
+        return "windows changed"
+    min_x = min(rect[0] for rect in rects)
+    min_y = min(rect[1] for rect in rects)
+    max_x = max(rect[0] + rect[2] for rect in rects)
+    max_y = max(rect[1] + rect[3] for rect in rects)
+    width = max_x - min_x
+    height = max_y - min_y
+    if width <= 0 or height <= 0:
+        return "degenerate bounds"
+    expected = _tree_expected_rects(axes, ratios)
+    for rect, target in zip(rects, expected):
+        unit = (
+            (rect[0] - min_x) / width,
+            (rect[1] - min_y) / height,
+            rect[2] / width,
+            rect[3] / height,
+        )
+        for actual_value, expected_value in zip(unit, target):
+            if abs(actual_value - expected_value) > TREE_VERIFY_TOLERANCE:
+                return "geometry mismatch"
+    return ""
 
 
 def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:

@@ -48,28 +48,38 @@ Panel {
   // Scrolling column presets, keyed by tiled-window count. The panel already
   // refreshes on openwindow/closewindow, so this list follows the workspace
   // live as windows appear and disappear.
+  // 'f' = that column takes the full viewport width (colresize 1.0); the
+  // strip then scrolls. Numeric weights tile the viewport together.
   readonly property var colPresetsByCount: ({
-    2: ["1:1", "1:2", "2:1", "1:3", "3:1"],
-    3: ["1:1:1", "1:2:1", "2:1:1", "1:1:2"],
-    4: ["1:1:1:1", "1:2:2:1", "2:1:1:2"],
-    5: ["1:1:1:1:1", "1:1:2:1:1"],
-    6: ["1:1:1:1:1:1"]
+    2: ["1:1", "1:2", "2:1", "1:3", "3:1", "f:f"],
+    3: ["1:1:1", "1:2:1", "2:1:1", "1:1:2", "f:1:1", "f:f:f"],
+    4: ["1:1:1:1", "1:2:2:1", "2:1:1:2", "f:1:1:1", "f:f:f:f"],
+    5: ["1:1:1:1:1", "1:1:2:1:1", "f:1:1:1:1"],
+    6: ["1:1:1:1:1:1", "f:1:1:1:1:1"]
   })
   readonly property var colPresets: root.layoutName === "scrolling"
     ? (root.colPresetsByCount[root.tiledWindows] || []) : []
   readonly property bool colsAvailable: !root.busy && root.colPresets.length > 0
     && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
 
+  // Viewport fractions per column; 'f' tokens are full-width (1.0). For the
+  // thumbnail the fractions are rescaled so the segments fit the box.
   function colWeights(spec) {
     var parts = String(spec).split(":")
     var weights = []
     var total = 0
     for (var index = 0; index < parts.length; index++) {
-      var weight = Number(parts[index])
-      weights.push(weight)
-      total += weight
+      if (parts[index] === "f") continue
+      total += Number(parts[index])
     }
-    for (var i = 0; i < weights.length; i++) weights[i] = weights[i] / total
+    var sum = 0
+    for (var j = 0; j < parts.length; j++) {
+      var fraction = parts[j] === "f" ? 1.0 : Number(parts[j]) / total
+      weights.push(fraction)
+      sum += fraction
+    }
+    if (sum > 1.001)
+      for (var k = 0; k < weights.length; k++) weights[k] = weights[k] / sum
     return weights
   }
 
@@ -88,20 +98,43 @@ Panel {
   // Dwindle tree presets, keyed by tiled-window count. Two windows get the
   // vertical ratios (the horizontal ones are the intent cards above); three
   // windows get every root+nested shape the backend can build.
+  // Spec: AXES:R1:...:R(n-1) — chain node axes (h/v) and first-child shares.
+  // Covers the classic tiling families: master+stack, columns, rows, grid,
+  // fibonacci/dwindle spiral, centered-ish wide main.
   readonly property var treePresetsByCount: ({
     2: [
-      { spec: "1-1:v", label: "1:1 rows" },
-      { spec: "1-2:v", label: "1:2 rows" },
-      { spec: "2-1:v", label: "2:1 rows" }
+      { spec: "v:1-1", label: "1:1 rows" },
+      { spec: "v:1-2", label: "1:2 rows" },
+      { spec: "v:2-1", label: "2:1 rows" }
     ],
     3: [
-      { spec: "2-1:hv:1-1", label: "Main left" },
-      { spec: "1-1:hv:1-1", label: "Half + stack" },
-      { spec: "1-2:hh:1-1", label: "3 columns" },
-      { spec: "1-1:hh:1-1", label: "½ + 2 cols" },
-      { spec: "2-1:vh:1-1", label: "Main top" },
-      { spec: "1-1:vh:1-1", label: "½ + 2 below" },
-      { spec: "1-2:vv:1-1", label: "3 rows" }
+      { spec: "hv:2-1:1-1", label: "Main left" },
+      { spec: "hv:1-1:1-1", label: "Half + stack" },
+      { spec: "hh:1-2:1-1", label: "3 columns" },
+      { spec: "vh:2-1:1-1", label: "Main top" },
+      { spec: "vh:1-1:1-1", label: "½ + 2 below" },
+      { spec: "vv:1-2:1-1", label: "3 rows" },
+      { spec: "hv:1-2:1-1", label: "Fibonacci" }
+    ],
+    4: [
+      { spec: "hvv:1-1:1-2:1-1", label: "Main + 3 stack" },
+      { spec: "hvv:2-1:1-2:1-1", label: "Wide main + 3" },
+      { spec: "hhh:1-3:1-2:1-1", label: "4 columns" },
+      { spec: "vvv:1-3:1-2:1-1", label: "4 rows" },
+      { spec: "hhv:1-2:1-1:1-1", label: "3 cols + split" },
+      { spec: "hvh:1-1:1-1:1-1", label: "Spiral" }
+    ],
+    5: [
+      { spec: "hvvv:1-1:1-3:1-2:1-1", label: "Main + 4 stack" },
+      { spec: "hvvv:2-1:1-3:1-2:1-1", label: "Wide main + 4" },
+      { spec: "hhhh:1-4:1-3:1-2:1-1", label: "5 columns" },
+      { spec: "vvvv:1-4:1-3:1-2:1-1", label: "5 rows" },
+      { spec: "hvhv:1-1:1-1:1-1:1-1", label: "Spiral" }
+    ],
+    6: [
+      { spec: "hvvvv:1-1:1-4:1-3:1-2:1-1", label: "Main + 5 stack" },
+      { spec: "hhhhh:1-5:1-4:1-3:1-2:1-1", label: "6 columns" },
+      { spec: "hvhvh:1-1:1-1:1-1:1-1:1-1", label: "Spiral" }
     ]
   })
   readonly property var treePresets: root.layoutName === "dwindle"
@@ -109,47 +142,28 @@ Panel {
   readonly property bool treeAvailable: !root.busy && root.treePresets.length > 0
     && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
 
-  // Unit-space rectangles {x,y,w,h in 0..1} describing a tree spec, for the
-  // preset card thumbnails.
+  // Unit-space rectangles {x,y,w,h in 0..1} for a chain spec AXES:R1:...:Rk,
+  // used by the preset card thumbnails. Mirrors the backend's
+  // _tree_expected_rects.
   function treeRects(spec) {
     var parts = String(spec).split(":")
-    var outer = parts[0].split("-")
-    var oShare = Number(outer[0]) / (Number(outer[0]) + Number(outer[1]))
-    var axes = parts[1]
+    var axes = parts[0]
     var rects = []
-    if (parts.length < 3) {
-      if (axes === "h") {
-        rects.push({ x: 0, y: 0, w: oShare, h: 1 })
-        rects.push({ x: oShare, y: 0, w: 1 - oShare, h: 1 })
+    var x = 0, y = 0, w = 1, h = 1
+    for (var index = 0; index < axes.length; index++) {
+      var ratio = parts[index + 1].split("-")
+      var share = Number(ratio[0]) / (Number(ratio[0]) + Number(ratio[1]))
+      if (axes[index] === "h") {
+        rects.push({ x: x, y: y, w: w * share, h: h })
+        x += w * share
+        w *= 1 - share
       } else {
-        rects.push({ x: 0, y: 0, w: 1, h: oShare })
-        rects.push({ x: 0, y: oShare, w: 1, h: 1 - oShare })
-      }
-      return rects
-    }
-    var inner = parts[2].split("-")
-    var iShare = Number(inner[0]) / (Number(inner[0]) + Number(inner[1]))
-    if (axes[0] === "h") {
-      rects.push({ x: 0, y: 0, w: oShare, h: 1 })
-      if (axes[1] === "v") {
-        rects.push({ x: oShare, y: 0, w: 1 - oShare, h: iShare })
-        rects.push({ x: oShare, y: iShare, w: 1 - oShare, h: 1 - iShare })
-      } else {
-        var innerWidth = (1 - oShare) * iShare
-        rects.push({ x: oShare, y: 0, w: innerWidth, h: 1 })
-        rects.push({ x: oShare + innerWidth, y: 0, w: 1 - oShare - innerWidth, h: 1 })
-      }
-    } else {
-      rects.push({ x: 0, y: 0, w: 1, h: oShare })
-      if (axes[1] === "h") {
-        rects.push({ x: 0, y: oShare, w: iShare, h: 1 - oShare })
-        rects.push({ x: iShare, y: oShare, w: 1 - iShare, h: 1 - oShare })
-      } else {
-        var innerHeight = (1 - oShare) * iShare
-        rects.push({ x: 0, y: oShare, w: 1, h: innerHeight })
-        rects.push({ x: 0, y: oShare + innerHeight, w: 1, h: 1 - oShare - innerHeight })
+        rects.push({ x: x, y: y, w: w, h: h * share })
+        y += h * share
+        h *= 1 - share
       }
     }
+    rects.push({ x: x, y: y, w: w, h: h })
     return rects
   }
 

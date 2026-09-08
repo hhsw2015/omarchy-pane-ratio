@@ -1316,24 +1316,39 @@ if __name__ == "__main__":
 
 
 class SpecParsingTests(unittest.TestCase):
-    def test_cols_spec_accepts_two_to_six_weights(self):
-        self.assertEqual(pane_ratio._parse_cols_spec("1:2"), [1, 2])
-        self.assertEqual(
-            pane_ratio._parse_cols_spec("1:1:2:1:1:1"), [1, 1, 2, 1, 1, 1]
-        )
+    def test_cols_spec_fractions(self):
+        self.assertEqual(pane_ratio._parse_cols_spec("1:1"), [0.5, 0.5])
+        self.assertEqual(pane_ratio._parse_cols_spec("f:1:1"), [1.0, 0.5, 0.5])
+        self.assertEqual(pane_ratio._parse_cols_spec("f:f"), [1.0, 1.0])
+        result = pane_ratio._parse_cols_spec("1:2:1")
+        self.assertAlmostEqual(result[1], 0.5)
 
     def test_cols_spec_rejects_bad_input(self):
-        for spec in ("1", "0:1", "21:1", "1:2:3:4:5:6:7", "x;rm", "1:-2", ""):
+        for spec in ("1", "0:1", "21:1", "1:2:3:4:5:6:7", "x;rm", "1:-2", "", "g:1"):
             with self.assertRaises(pane_ratio.PaneRatioError):
                 pane_ratio._parse_cols_spec(spec)
 
     def test_tree_spec_shapes(self):
-        valid = ("1-1:h", "2-1:v", "1-1:hv:1-1", "1-2:hh:2-1", "1-1:vh:1-1", "1-2:vv:1-1")
+        valid = ("h:1-1", "v:2-1", "hv:1-1:1-1", "hvv:1-1:1-2:1-1",
+                 "hvhvh:1-1:1-1:1-1:1-1:1-1")
         for spec in valid:
-            self.assertIsNotNone(pane_ratio.TREE_SPEC_RE.fullmatch(spec), spec)
-        invalid = ("1-1", "1-1:z", "1-1:hvv:1-1", "1-1:hv", "1-1:h:1-1", "0-1:h", "1-1:hv:0-1", "a-1:h")
+            pane_ratio._parse_tree_spec(spec)
+        invalid = ("1-1", "z:1-1", "hv:1-1", "h:1-1:1-1", "h:0-1", "hv:1-1:0-1",
+                   "hvhvhh:1-1:1-1:1-1:1-1:1-1:1-1", "")
         for spec in invalid:
-            self.assertIsNone(pane_ratio.TREE_SPEC_RE.fullmatch(spec), spec)
+            with self.assertRaises(pane_ratio.PaneRatioError):
+                pane_ratio._parse_tree_spec(spec)
+
+    def test_tree_expected_rects_chain(self):
+        rects = pane_ratio._tree_expected_rects("hv", [(1, 1), (1, 1)])
+        self.assertEqual(rects[0], (0.0, 0.0, 0.5, 1.0))
+        self.assertEqual(rects[1], (0.5, 0.0, 0.5, 0.5))
+        self.assertEqual(rects[2], (0.5, 0.5, 0.5, 0.5))
+        rects = pane_ratio._tree_expected_rects(
+            "hhh", [(1, 3), (1, 2), (1, 1)]
+        )
+        for rect in rects:
+            self.assertAlmostEqual(rect[2], 0.25)
 
     def test_share_to_splitratio_matches_live_semantics(self):
         # Verified live: splitratio 0.666667 exact -> first child 1/3,
