@@ -50,15 +50,35 @@ Panel {
   // live as windows appear and disappear.
   // 'f' = that column takes the full viewport width (colresize 1.0); the
   // strip then scrolls. Numeric weights tile the viewport together.
-  readonly property var colPresetsByCount: ({
-    2: ["1:1", "1:2", "2:1", "1:3", "3:1", "f:f"],
-    3: ["1:1:1", "1:2:1", "2:1:1", "1:1:2", "f:1:1", "f:f:f"],
-    4: ["1:1:1:1", "1:2:2:1", "2:1:1:2", "f:1:1:1", "f:f:f:f"],
-    5: ["1:1:1:1:1", "1:1:2:1:1", "f:1:1:1:1"],
-    6: ["1:1:1:1:1:1", "f:1:1:1:1:1"]
+  readonly property var colWeightedByCount: ({
+    2: ["1:1", "1:2", "2:1", "1:3", "3:1"],
+    3: ["1:1:1", "1:2:1", "2:1:1", "1:1:2"],
+    4: ["1:1:1:1", "1:2:2:1", "2:1:1:2"],
+    5: ["1:1:1:1:1", "1:1:2:1:1"],
+    6: ["1:1:1:1:1:1"]
   })
-  readonly property var colPresets: root.layoutName === "scrolling"
-    ? (root.colPresetsByCount[root.tiledWindows] || []) : []
+  // Full-width variants are generated, not listed: one card per position
+  // ('f' there, the rest equal) plus the all-full carousel, so every column
+  // can be the full-width one at any window count.
+  readonly property var colPresets: {
+    if (root.layoutName !== "scrolling") return []
+    var count = root.tiledWindows
+    var list = (root.colWeightedByCount[count] || []).slice()
+    if (count < 2 || count > 6) return list
+    // Position cards need >=2 remaining numeric columns: a lone numeric
+    // weight normalizes to the whole viewport, collapsing "f:1" into "f:f".
+    if (count >= 3)
+      for (var position = 0; position < count; position++) {
+        var parts = []
+        for (var index = 0; index < count; index++)
+          parts.push(index === position ? "f" : "1")
+        list.push(parts.join(":"))
+      }
+    var full = []
+    for (var k = 0; k < count; k++) full.push("f")
+    list.push(full.join(":"))
+    return list
+  }
   readonly property bool colsAvailable: !root.busy && root.colPresets.length > 0
     && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
 
