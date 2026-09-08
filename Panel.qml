@@ -103,9 +103,11 @@ Panel {
   // fibonacci/dwindle spiral, centered-ish wide main.
   readonly property var treePresetsByCount: ({
     2: [
-      { spec: "v:1-1", label: "1:1 rows" },
+      { spec: "v:1-3", label: "1:3 rows" },
       { spec: "v:1-2", label: "1:2 rows" },
-      { spec: "v:2-1", label: "2:1 rows" }
+      { spec: "v:1-1", label: "1:1 rows" },
+      { spec: "v:2-1", label: "2:1 rows" },
+      { spec: "v:3-1", label: "3:1 rows" }
     ],
     3: [
       { spec: "hv:2-1:1-1", label: "Main left" },
@@ -187,7 +189,12 @@ Panel {
     || root.layoutFinishing || colsProcess.running || root.colsFinishing
     || treeProcess.running || root.treeFinishing
   readonly property bool applying: applyProcess.running || root.applyFinishing
+  // Two-pane ratios only make sense up to two tiled windows (0/1 = save a
+  // Waiting intent, 2 = apply now). At 3+ the arrangements section rules;
+  // leaving these active would silently save an intent that fires later
+  // when the count drops back to 2.
   readonly property bool ratioAvailable: !root.busy && root.errorText === ""
+    && root.tiledWindows <= 2
     && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
   readonly property color foreground: Color.popups.text
   readonly property color mutedForeground: Qt.darker(foreground, 1.45)
@@ -656,7 +663,7 @@ Panel {
         }
 
         Text {
-          visible: root.layoutName === "dwindle"
+          visible: root.layoutName === "dwindle" && root.tiledWindows <= 2
           width: parent.width
           text: "Choose a left : right ratio"
           color: root.foreground
@@ -666,7 +673,7 @@ Panel {
         }
 
         Grid {
-          visible: root.layoutName === "dwindle"
+          visible: root.layoutName === "dwindle" && root.tiledWindows <= 2
           width: parent.width
           columns: 3
           spacing: Style.space(8)
