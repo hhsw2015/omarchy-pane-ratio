@@ -101,14 +101,9 @@ Panel {
   // Spec: AXES:R1:...:R(n-1) — chain node axes (h/v) and first-child shares.
   // Covers the classic tiling families: master+stack, columns, rows, grid,
   // fibonacci/dwindle spiral, centered-ish wide main.
+  // No 2-window entry: the ratio cards are orientation-aware and the split
+  // toggle flips h/v, which together cover every two-pane shape.
   readonly property var treePresetsByCount: ({
-    2: [
-      { spec: "v:1-3", label: "1:3 rows" },
-      { spec: "v:1-2", label: "1:2 rows" },
-      { spec: "v:1-1", label: "1:1 rows" },
-      { spec: "v:2-1", label: "2:1 rows" },
-      { spec: "v:3-1", label: "3:1 rows" }
-    ],
     3: [
       { spec: "hv:2-1:1-1", label: "Main left" },
       { spec: "hv:1-1:1-1", label: "Half + stack" },
@@ -272,10 +267,25 @@ Panel {
     statusProcess.running = true
   }
 
+  // Two tiled windows stacked top/bottom: the ratio section follows the
+  // pair's orientation instead of always claiming left:right.
+  readonly property bool pairVertical: root.orientation === "vertical"
+    && root.tiledWindows === 2
+
   function applyRatio(ratio) {
     if (!root.ratioAvailable || root.presets.indexOf(ratio) < 0) return
     root.errorText = ""
     root.statusText = "Applying " + ratio + "…"
+    if (root.pairVertical) {
+      // Vertical pairs go through tree apply (direct, no saved intent —
+      // the intent store's auto-reapply is horizontal-only by design).
+      // Custom presets with double-digit sides fall outside TREE_SPEC_RE
+      // and are rejected by the backend with a visible message.
+      root.pendingTree = "v:" + ratio.replace(":", "-")
+      root.resetOutput(true)
+      treeProcess.running = true
+      return
+    }
     root.pendingRatio = ratio
     root.resetOutput(true)
     applyProcess.running = true
@@ -665,7 +675,9 @@ Panel {
         Text {
           visible: root.layoutName === "dwindle" && root.tiledWindows <= 2
           width: parent.width
-          text: "Choose a left : right ratio"
+          text: root.pairVertical
+            ? "Choose a top : bottom ratio"
+            : "Choose a left : right ratio"
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
@@ -698,7 +710,7 @@ Panel {
               border.color: selected ? root.accent : Util.alpha(root.foreground, 0.42)
               opacity: available ? 1 : 0.48
               Accessible.role: Accessible.Button
-              Accessible.name: modelData + " left to right"
+              Accessible.name: modelData + (root.pairVertical ? " top to bottom" : " left to right")
               Accessible.description: selected ? "Saved workspace rule" : "Save workspace rule"
               Accessible.onPressAction: root.applyRatio(modelData)
 
@@ -707,9 +719,11 @@ Panel {
                 spacing: Style.space(6)
 
                 Rectangle {
-                  width: Math.max(Style.space(38),
-                    Math.min(Style.space(64), presetCard.width - Style.space(16)))
-                  height: Style.space(24)
+                  width: root.pairVertical
+                    ? Style.space(40)
+                    : Math.max(Style.space(38),
+                        Math.min(Style.space(64), presetCard.width - Style.space(16)))
+                  height: root.pairVertical ? Style.space(30) : Style.space(24)
                   radius: Math.max(3, Style.cornerRadius - 1)
                   color: "transparent"
                   border.width: 1
@@ -720,8 +734,12 @@ Panel {
                   Rectangle {
                     x: Style.space(3)
                     y: Style.space(3)
-                    width: (parent.width - Style.space(8)) * root.presetShares[presetCard.index]
-                    height: parent.height - Style.space(6)
+                    width: root.pairVertical
+                      ? parent.width - Style.space(6)
+                      : (parent.width - Style.space(8)) * root.presetShares[presetCard.index]
+                    height: root.pairVertical
+                      ? (parent.height - Style.space(8)) * root.presetShares[presetCard.index]
+                      : parent.height - Style.space(6)
                     radius: Math.max(2, Style.cornerRadius - 2)
                     color: presetCard.selected
                       ? root.accent
@@ -731,10 +749,17 @@ Panel {
                   Rectangle {
                     anchors.right: parent.right
                     anchors.rightMargin: Style.space(3)
-                    y: Style.space(3)
-                    width: (parent.width - Style.space(8))
-                      * (1 - root.presetShares[presetCard.index])
-                    height: parent.height - Style.space(6)
+                    anchors.bottom: root.pairVertical ? parent.bottom : undefined
+                    anchors.bottomMargin: root.pairVertical ? Style.space(3) : 0
+                    y: root.pairVertical ? 0 : Style.space(3)
+                    width: root.pairVertical
+                      ? parent.width - Style.space(6)
+                      : (parent.width - Style.space(8))
+                        * (1 - root.presetShares[presetCard.index])
+                    height: root.pairVertical
+                      ? (parent.height - Style.space(8))
+                        * (1 - root.presetShares[presetCard.index])
+                      : parent.height - Style.space(6)
                     radius: Math.max(2, Style.cornerRadius - 2)
                     color: presetCard.selected
                       ? Util.alpha(root.accent, 0.52)
