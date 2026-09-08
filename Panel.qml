@@ -709,11 +709,22 @@ Panel {
         Text {
           visible: root.tiledWindows <= 2
           width: parent.width
-          text: "Arrangements · 2 windows"
+          text: "Arrangements · 2 windows · Dwindle"
+            + (root.layoutName === "dwindle" ? " (current)" : "")
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
           font.bold: true
+        }
+
+        Text {
+          visible: root.tiledWindows <= 2 && root.layoutName !== "dwindle"
+          width: parent.width
+          text: "Picking one switches this workspace to Dwindle"
+          color: root.mutedForeground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
         Grid {
@@ -846,11 +857,22 @@ Panel {
         Text {
           visible: root.treePresets.length > 0
           width: parent.width
-          text: "Arrangements · " + root.tiledWindows + " windows"
+          text: "Arrangements · " + root.tiledWindows + " windows · Dwindle"
+            + (root.layoutName === "dwindle" ? " (current)" : "")
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
           font.bold: true
+        }
+
+        Text {
+          visible: root.treePresets.length > 0 && root.layoutName !== "dwindle"
+          width: parent.width
+          text: "Picking one switches this workspace to Dwindle"
+          color: root.mutedForeground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
         Grid {
@@ -935,7 +957,8 @@ Panel {
         Text {
           visible: root.colPresets.length > 0
           width: parent.width
-          text: "Full-width columns · " + root.tiledWindows + " windows"
+          text: "Full-width columns · " + root.tiledWindows + " windows · Scrolling"
+            + (root.layoutName === "scrolling" ? " (current)" : "")
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
@@ -946,6 +969,7 @@ Panel {
           visible: root.colPresets.length > 0
           width: parent.width
           text: "Scrolling strip — the highlighted column fills the screen, the rest scroll sideways"
+            + (root.layoutName === "scrolling" ? "" : " · picking one switches this workspace to Scrolling")
           color: root.mutedForeground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -1072,11 +1096,9 @@ Panel {
 
         Text {
           width: parent.width
-          text: (root.layoutName === "dwindle"
-              ? "Keys 1–9 pick arrangements"
-                + (root.intentRatio === "" ? "" : " · D forget")
-              : "Click a column preset to size the strip")
-            + " · L layout · R refresh"
+          text: "Pick a shape — the workspace mode follows it"
+            + (root.intentRatio === "" ? "" : " · D forget")
+            + " · R refresh"
           color: root.mutedForeground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
