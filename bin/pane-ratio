@@ -185,27 +185,53 @@ ICON_SIZE_DIRS = (
 )
 
 
+APP_DIRS = (
+    Path.home() / ".local/share/applications",
+    Path("/usr/local/share/applications"),
+    Path("/usr/share/applications"),
+)
+
+
+def _entry_fields(path: Path) -> tuple[str, str]:
+    """(Icon, StartupWMClass) from a .desktop file, empty when absent."""
+    icon = wm_class = ""
+    try:
+        for line in path.read_text(errors="ignore").splitlines():
+            if line.startswith("Icon=") and not icon:
+                icon = line[5:].strip()
+            elif line.startswith("StartupWMClass=") and not wm_class:
+                wm_class = line[15:].strip()
+    except OSError:
+        pass
+    return icon, wm_class
+
+
 def _desktop_icon_name(class_name: str) -> str:
-    """Icon= value from the .desktop entry matching a window class."""
+    """Icon= value from the .desktop entry matching a window class.
+
+    Exact/lowercase file names first, then a scan matching StartupWMClass
+    (v2rayN ships as v2rayN-bin.desktop with StartupWMClass=v2rayN, so the
+    file-name lookup alone misses it).
+    """
     if not class_name:
         return ""
-    candidates = [class_name, class_name.lower()]
-    app_dirs = (
-        Path.home() / ".local/share/applications",
-        Path("/usr/local/share/applications"),
-        Path("/usr/share/applications"),
-    )
-    for candidate in candidates:
-        for base in app_dirs:
+    for candidate in (class_name, class_name.lower()):
+        for base in APP_DIRS:
             entry = base / f"{candidate}.desktop"
-            try:
-                if not entry.is_file():
-                    continue
-                for line in entry.read_text(errors="ignore").splitlines():
-                    if line.startswith("Icon="):
-                        return line[5:].strip()
-            except OSError:
-                continue
+            if entry.is_file():
+                icon, _wm = _entry_fields(entry)
+                if icon:
+                    return icon
+    wanted = class_name.lower()
+    for base in APP_DIRS:
+        try:
+            entries = sorted(base.glob("*.desktop"))
+        except OSError:
+            continue
+        for entry in entries[:512]:
+            icon, wm_class = _entry_fields(entry)
+            if wm_class and wm_class.lower() == wanted and icon:
+                return icon
     return class_name.lower()
 
 
@@ -228,6 +254,15 @@ def _icon_file(icon_name: str) -> str:
                 candidate = base / f"{icon_name}{suffix}"
                 if candidate.is_file():
                     return str(candidate)
+            # Case-insensitive fallback: Icon= names and shipped files can
+            # disagree in case (icon "v2rayn" vs /usr/share/pixmaps/v2rayN.png).
+            try:
+                lowered = icon_name.lower()
+                for candidate in base.iterdir():
+                    if candidate.stem.lower() == lowered and candidate.suffix in suffixes:
+                        return str(candidate)
+            except OSError:
+                pass
             continue
         for size_dir in ICON_SIZE_DIRS:
             for suffix in suffixes:
