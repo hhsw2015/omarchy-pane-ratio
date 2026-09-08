@@ -94,6 +94,10 @@ class LayoutState:
     phase: str = "unknown"
     intent_ratio: str = ""
     reason_code: str = "none"
+    # Window classes in reading order (x, then y) — the same order tree and
+    # column presets apply in, so the panel can badge each pane thumbnail
+    # with the app it will resize.
+    window_classes: tuple[str, ...] = ()
 
     @property
     def workspace(self) -> int:
@@ -141,6 +145,8 @@ class LayoutState:
             "splitEligible": self.split_eligible,
             "layoutEligible": self.layout_eligible,
             "message": self.message,
+            "windowClasses": list(self.window_classes),
+            "windowIcons": _window_icon_paths(self.window_classes),
         }
         if presets is not None:
             payload["presets"] = [
@@ -170,7 +176,75 @@ class LayoutState:
             phase,
             ratio,
             reason_code or self.reason_code,
+            self.window_classes,
         )
+
+
+ICON_SIZE_DIRS = (
+    "64x64", "48x48", "128x128", "32x32", "96x96", "256x256", "scalable",
+)
+
+
+def _desktop_icon_name(class_name: str) -> str:
+    """Icon= value from the .desktop entry matching a window class."""
+    if not class_name:
+        return ""
+    candidates = [class_name, class_name.lower()]
+    app_dirs = (
+        Path.home() / ".local/share/applications",
+        Path("/usr/local/share/applications"),
+        Path("/usr/share/applications"),
+    )
+    for candidate in candidates:
+        for base in app_dirs:
+            entry = base / f"{candidate}.desktop"
+            try:
+                if not entry.is_file():
+                    continue
+                for line in entry.read_text(errors="ignore").splitlines():
+                    if line.startswith("Icon="):
+                        return line[5:].strip()
+            except OSError:
+                continue
+    return class_name.lower()
+
+
+def _icon_file(icon_name: str) -> str:
+    """Absolute icon path for a themed icon name, empty when unresolved."""
+    if not icon_name:
+        return ""
+    if icon_name.startswith("/"):
+        return icon_name if Path(icon_name).is_file() else ""
+    theme_bases = (
+        Path.home() / ".local/share/icons",
+        Path("/usr/share/icons/hicolor"),
+        Path("/usr/share/icons/Adwaita"),
+        Path("/usr/share/pixmaps"),
+    )
+    suffixes = (".png", ".svg", ".xpm")
+    for base in theme_bases:
+        if base.name == "pixmaps":
+            for suffix in suffixes:
+                candidate = base / f"{icon_name}{suffix}"
+                if candidate.is_file():
+                    return str(candidate)
+            continue
+        for size_dir in ICON_SIZE_DIRS:
+            for suffix in suffixes:
+                candidate = base / size_dir / "apps" / f"{icon_name}{suffix}"
+                if candidate.is_file():
+                    return str(candidate)
+    return ""
+
+
+def _window_icon_paths(classes: tuple[str, ...]) -> list[str]:
+    cache: dict[str, str] = {}
+    paths = []
+    for class_name in classes:
+        if class_name not in cache:
+            cache[class_name] = _icon_file(_desktop_icon_name(class_name))
+        paths.append(cache[class_name])
+    return paths
 
 
 def _xdg_base(variable: str, fallback: tuple[str, ...], reason_code: str) -> Path:
@@ -982,6 +1056,7 @@ def analyze(
         count: int = 0,
         orientation: str = "unknown",
         phase: str = "paused_mode",
+        classes: tuple[str, ...] = (),
     ) -> LayoutState:
         return LayoutState(
             identity,
@@ -997,6 +1072,7 @@ def analyze(
             phase,
             "",
             reason_code,
+            classes,
         )
 
     if identity.kind == "unknown":
@@ -1025,6 +1101,21 @@ def analyze(
             continue
         tiled.append(client)
 
+    # Window classes in reading order (x, then y) — presets apply in this
+    # order, so the panel can badge pane thumbnails with app icons.
+    def reading_order_classes() -> tuple[str, ...]:
+        keyed = []
+        for client in tiled:
+            position = _pair(client.get("at")) or (0, 0)
+            cls = client.get("class")
+            keyed.append(
+                (position[0], position[1], cls if isinstance(cls, str) else "")
+            )
+        keyed.sort()
+        return tuple(cls[:128] for _x, _y, cls in keyed)
+
+    window_classes = reading_order_classes()
+
     # Ratio intents are Dwindle-only, but the tiled count is reported for
     # every layout so the panel can offer layout-appropriate actions (the
     # Scrolling column presets scale with this number).
@@ -1033,6 +1124,7 @@ def analyze(
             "Ratio presets apply to the Dwindle layout only.",
             "unsupported_layout",
             len(tiled),
+            classes=window_classes,
         )
     if workspace_object.get("hasfullscreen") is not False:
         return unavailable(
@@ -1048,12 +1140,14 @@ def analyze(
             f"Waiting for a second tiled window; found {len(tiled)}.",
             "waiting_window",
             len(tiled),
+            classes=window_classes,
         )
     if len(tiled) > 2:
         return unavailable(
             f"Paused because this workspace has {len(tiled)} tiled windows.",
             "topology",
             len(tiled),
+            classes=window_classes,
         )
 
     addresses: list[str] = []
@@ -1112,6 +1206,7 @@ def analyze(
             "paused_mode",
             "",
             "ambiguous_split",
+            window_classes,
         )
     if active_address not in sorted_addresses:
         return LayoutState(
@@ -1128,6 +1223,7 @@ def analyze(
             "paused_mode",
             "",
             "focus_required",
+            window_classes,
         )
 
     if vertical:
@@ -1145,6 +1241,7 @@ def analyze(
             "paused_mode",
             "",
             "vertical_split",
+            window_classes,
         )
 
     left_share = left[2] / (left[2] + right[2])
@@ -1162,6 +1259,7 @@ def analyze(
         "eligible",
         "",
         "ready",
+        window_classes,
     )
 
 
@@ -1516,7 +1614,12 @@ def _parse_cols_spec(spec: str) -> list[float]:
     return fractions
 
 
-def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
+def apply_columns(
+    hyprctl: Hyprctl,
+    store: IntentStore,
+    spec: str,
+    layout_store: "WorkspaceLayoutStore | None" = None,
+) -> LayoutState:
     """Scrolling layout: size the workspace's columns left-to-right by spec.
 
     Deterministic by construction — Scrolling is an ordered strip, so column
@@ -1530,12 +1633,22 @@ def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutStat
     if not first.identity.supported:
         return first
     if first.layout != "scrolling":
-        return first.with_intent(
-            first.intent_ratio,
-            "paused_mode",
-            "Column presets apply to the Scrolling layout only.",
-            "unsupported_layout",
+        # Column shapes imply the Scrolling layout; switch the workspace
+        # first so the user picks a shape, not a mode.
+        set_workspace_layout(
+            hyprctl, store, layout_store or WorkspaceLayoutStore(), "scrolling"
         )
+        # Let the relayout settle before driving the new layout; dispatching
+        # colresize mid-transition has locked the compositor up once.
+        time.sleep(0.3)
+        first = read_state(hyprctl, deadline=deadline, presets=store.presets)
+        if first.layout != "scrolling":
+            return first.with_intent(
+                first.intent_ratio,
+                "paused_mode",
+                "Could not switch this workspace to the Scrolling layout.",
+                "unsupported_layout",
+            )
     if first.tiled_windows != len(fractions):
         return first.with_intent(
             first.intent_ratio,
@@ -1683,7 +1796,12 @@ def _reading_order_addresses(
     return [address for _x, _y, address in entries]
 
 
-def apply_tree(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
+def apply_tree(
+    hyprctl: Hyprctl,
+    store: IntentStore,
+    spec: str,
+    layout_store: "WorkspaceLayoutStore | None" = None,
+) -> LayoutState:
     """Dwindle: shape the workspace's window chain to a preset (2-6 windows).
 
     Node k is adjusted through window k: axis mismatches are fixed with
@@ -1699,12 +1817,22 @@ def apply_tree(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
     if not first.identity.supported:
         return first
     if first.layout != "dwindle":
-        return first.with_intent(
-            first.intent_ratio,
-            "paused_mode",
-            "Tree presets apply to the Dwindle layout only.",
-            "unsupported_layout",
+        # Tree shapes imply the Dwindle layout; switch the workspace first
+        # so the user picks a shape, not a mode.
+        set_workspace_layout(
+            hyprctl, store, layout_store or WorkspaceLayoutStore(), "dwindle"
         )
+        # Same settle as the scrolling path: never drive a layout that is
+        # still transitioning.
+        time.sleep(0.3)
+        first = read_state(hyprctl, deadline=deadline, presets=store.presets)
+        if first.layout != "dwindle":
+            return first.with_intent(
+                first.intent_ratio,
+                "paused_mode",
+                "Could not switch this workspace to the Dwindle layout.",
+                "unsupported_layout",
+            )
     if first.tiled_windows != expected_windows:
         return first.with_intent(
             first.intent_ratio,
@@ -2204,12 +2332,12 @@ def execute(
         emit(state.public(operation, ok=state.eligible, presets=presets))
         return 0 if state.eligible else 2
     if len(arguments) == 3 and arguments[:2] == ["cols", "apply"]:
-        state = apply_columns(hyprctl, store, arguments[2])
+        state = apply_columns(hyprctl, store, arguments[2], layout_store)
         success = state.phase == "applied"
         emit(state.public(operation, ok=success, presets=presets))
         return 0 if success else 2
     if len(arguments) == 3 and arguments[:2] == ["tree", "apply"]:
-        state = apply_tree(hyprctl, store, arguments[2])
+        state = apply_tree(hyprctl, store, arguments[2], layout_store)
         success = state.phase == "applied"
         emit(state.public(operation, ok=success, presets=presets))
         return 0 if success else 2

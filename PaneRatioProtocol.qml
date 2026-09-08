@@ -105,6 +105,27 @@ QtObject {
         || typeof payload.splitEligible !== "boolean"
         || typeof payload.layoutEligible !== "boolean")
       return root.invalid("Pane Ratio response fields are invalid.")
+    if (payload.windowClasses !== undefined) {
+      if (!Array.isArray(payload.windowClasses) || payload.windowClasses.length > 64)
+        return root.invalid("Pane Ratio window class list is invalid.")
+      for (var classIndex = 0; classIndex < payload.windowClasses.length; classIndex++) {
+        var windowClass = payload.windowClasses[classIndex]
+        if (typeof windowClass !== "string" || windowClass.length > 128
+            || /[\u0000-\u001f\u007f]/.test(windowClass))
+          return root.invalid("Pane Ratio window class list is invalid.")
+      }
+    }
+    if (payload.windowIcons !== undefined) {
+      if (!Array.isArray(payload.windowIcons) || payload.windowIcons.length > 64)
+        return root.invalid("Pane Ratio window icon list is invalid.")
+      for (var iconIndex = 0; iconIndex < payload.windowIcons.length; iconIndex++) {
+        var iconPath = payload.windowIcons[iconIndex]
+        if (typeof iconPath !== "string" || iconPath.length > 512
+            || (iconPath !== "" && iconPath.charAt(0) !== "/")
+            || /[\u0000-\u001f\u007f]/.test(iconPath))
+          return root.invalid("Pane Ratio window icon list is invalid.")
+      }
+    }
     if (payload.presets !== undefined) {
       if (!Array.isArray(payload.presets) || payload.presets.length < 1 || payload.presets.length > 9)
         return root.invalid("Pane Ratio preset response is invalid.")

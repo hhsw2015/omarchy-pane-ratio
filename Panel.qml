@@ -42,6 +42,19 @@ Panel {
 
   property var presets: ["1:3", "1:2", "1:1", "2:1", "3:1"]
   property var presetShares: [1 / 4, 1 / 3, 1 / 2, 2 / 3, 3 / 4]
+  // App classes of the tiled windows in reading order (x, then y) — the
+  // order every preset applies in. Lets thumbnails show which app lands in
+  // which pane.
+  property var windowClasses: []
+  // Absolute icon paths resolved by the backend (desktop entry Icon= ->
+  // hicolor/pixmaps file). DesktopEntries.heuristicLookup returns null in
+  // this environment, so resolution lives backend-side.
+  property var windowIcons: []
+
+  function windowIcon(index) {
+    var path = String(root.windowIcons[index] || "")
+    return path === "" ? "" : "file://" + path
+  }
   property string pendingCols: ""
   property bool colsFinishing: false
 
@@ -50,21 +63,14 @@ Panel {
   // live as windows appear and disappear.
   // 'f' = that column takes the full viewport width (colresize 1.0); the
   // strip then scrolls. Numeric weights tile the viewport together.
-  readonly property var colWeightedByCount: ({
-    2: ["1:1", "1:2", "2:1", "1:3", "3:1"],
-    3: ["1:1:1", "1:2:1", "2:1:1", "1:1:2"],
-    4: ["1:1:1:1", "1:2:2:1", "2:1:1:2"],
-    5: ["1:1:1:1:1", "1:1:2:1:1"],
-    6: ["1:1:1:1:1:1"]
-  })
-  // Full-width variants are generated, not listed: one card per position
-  // ('f' there, the rest equal) plus the all-full carousel, so every column
-  // can be the full-width one at any window count.
+  // Only the shapes unique to the Scrolling strip: one card per position
+  // ('f' there, the rest equal) plus the all-full carousel. Weighted column
+  // splits live in the arrangements cards (Dwindle); picking a card
+  // switches the workspace mode automatically, so no mode toggle is shown.
   readonly property var colPresets: {
-    if (root.layoutName !== "scrolling") return []
     var count = root.tiledWindows
-    var list = (root.colWeightedByCount[count] || []).slice()
-    if (count < 2 || count > 6) return list
+    if (count < 2 || count > 6) return []
+    var list = []
     // Position cards need >=2 remaining numeric columns: a lone numeric
     // weight normalizes to the whole viewport, collapsing "f:1" into "f:f".
     if (count >= 3)
@@ -154,8 +160,7 @@ Panel {
       { spec: "hvhvh:1-1:1-1:1-1:1-1:1-1", label: "Spiral" }
     ]
   })
-  readonly property var treePresets: root.layoutName === "dwindle"
-    ? (root.treePresetsByCount[root.tiledWindows] || []) : []
+  readonly property var treePresets: root.treePresetsByCount[root.tiledWindows] || []
   readonly property bool treeAvailable: !root.busy && root.treePresets.length > 0
     && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
 
@@ -215,7 +220,7 @@ Panel {
   readonly property color mutedForeground: Qt.darker(foreground, 1.45)
   readonly property color accent: Color.accent
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-  readonly property int focusTargetCount: root.pairCards.length + 3
+  readonly property int focusTargetCount: root.pairCards.length + 1
     + (root.intentRatio === "" ? 0 : 1)
   readonly property bool splitAvailable: !root.busy && root.errorText === ""
     && root.backendSplitEligible
@@ -307,7 +312,8 @@ Panel {
     if (!root.ratioAvailable) return
     root.errorText = ""
     root.statusText = "Applying " + card.ratio + "…"
-    if (!card.vertical && !root.pairVertical && root.tiledWindows === 2) {
+    if (!card.vertical && !root.pairVertical && root.tiledWindows === 2
+        && root.layoutName === "dwindle") {
       root.pendingRatio = card.ratio
       root.resetOutput(true)
       applyProcess.running = true
@@ -402,6 +408,8 @@ Panel {
       root.reasonCode = String(state.reasonCode || "internal")
       root.backendSplitEligible = state.splitEligible === true
       root.backendLayoutEligible = state.layoutEligible === true
+      root.windowClasses = Array.isArray(state.windowClasses) ? state.windowClasses : []
+      root.windowIcons = Array.isArray(state.windowIcons) ? state.windowIcons : []
       if (Array.isArray(state.presets) && state.presets.length > 0) {
         var labels = []
         var shares = []
@@ -452,17 +460,13 @@ Panel {
     if (root.busy) return false
     if (index === 0) return true
     if (index >= 1 && index <= root.pairCards.length) return root.ratioAvailable
-    if (index === root.pairCards.length + 1 || index === root.pairCards.length + 2)
-      return root.layoutAvailable
-    return index === root.pairCards.length + 3 && root.intentRatio !== ""
+    return index === root.pairCards.length + 1 && root.intentRatio !== ""
   }
 
   function activateFocused() {
     if (root.focusIndex === 0) root.refresh()
     else if (root.focusIndex <= root.pairCards.length)
       root.applyPair(root.pairCards[root.focusIndex - 1])
-    else if (root.focusIndex === root.pairCards.length + 1) root.setWorkspaceLayout("dwindle")
-    else if (root.focusIndex === root.pairCards.length + 2) root.setWorkspaceLayout("scrolling")
     else root.clearIntent()
   }
 
@@ -638,7 +642,6 @@ Panel {
           if (index < root.pairCards.length) root.applyPair(root.pairCards[index])
         }
         else if (text === "d" || text === "D") root.clearIntent()
-        else if (text === "l" || text === "L") root.toggleWorkspaceLayout()
       }
 
       Column {
@@ -704,7 +707,7 @@ Panel {
         }
 
         Text {
-          visible: root.layoutName === "dwindle" && root.tiledWindows <= 2
+          visible: root.tiledWindows <= 2
           width: parent.width
           text: "Arrangements · 2 windows"
           color: root.foreground
@@ -714,7 +717,7 @@ Panel {
         }
 
         Grid {
-          visible: root.layoutName === "dwindle" && root.tiledWindows <= 2
+          visible: root.tiledWindows <= 2
           width: parent.width
           columns: 5
           spacing: Style.space(8)
@@ -775,6 +778,16 @@ Panel {
                     color: presetCard.selected
                       ? root.accent
                       : Util.alpha(root.foreground, 0.48)
+
+                    Image {
+                      anchors.centerIn: parent
+                      width: Math.min(parent.width, parent.height) - 2
+                      height: width
+                      sourceSize.width: 32
+                      sourceSize.height: 32
+                      source: root.windowIcon(0)
+                      visible: source !== "" && status === Image.Ready
+                    }
                   }
 
                   Rectangle {
@@ -794,6 +807,16 @@ Panel {
                     color: presetCard.selected
                       ? Util.alpha(root.accent, 0.52)
                       : Util.alpha(root.foreground, 0.22)
+
+                    Image {
+                      anchors.centerIn: parent
+                      width: Math.min(parent.width, parent.height) - 2
+                      height: width
+                      sourceSize.width: 32
+                      sourceSize.height: 32
+                      source: root.windowIcon(1)
+                      visible: source !== "" && status === Image.Ready
+                    }
                   }
                 }
 
@@ -821,7 +844,7 @@ Panel {
         }
 
         Text {
-          visible: root.layoutName === "dwindle" && root.treePresets.length > 0
+          visible: root.treePresets.length > 0
           width: parent.width
           text: "Arrangements · " + root.tiledWindows + " windows"
           color: root.foreground
@@ -831,7 +854,7 @@ Panel {
         }
 
         Grid {
-          visible: root.layoutName === "dwindle" && root.treePresets.length > 0
+          visible: root.treePresets.length > 0
           width: parent.width
           columns: 3
           spacing: Style.space(8)
@@ -867,12 +890,23 @@ Panel {
 
                     Rectangle {
                       required property var modelData
+                      required property int index
                       x: modelData.x * Style.space(44) + 1
                       y: modelData.y * Style.space(26) + 1
                       width: Math.max(3, modelData.w * Style.space(44) - 2)
                       height: Math.max(3, modelData.h * Style.space(26) - 2)
                       radius: 2
                       color: Util.alpha(root.foreground, 0.48)
+
+                      Image {
+                        anchors.centerIn: parent
+                        width: Math.min(parent.width, parent.height) - 2
+                        height: width
+                        sourceSize.width: 32
+                        sourceSize.height: 32
+                        source: root.windowIcon(index)
+                        visible: source !== "" && status === Image.Ready
+                      }
                     }
                   }
                 }
@@ -899,21 +933,27 @@ Panel {
         }
 
         Text {
-          visible: root.layoutName === "scrolling"
+          visible: root.colPresets.length > 0
           width: parent.width
-          text: root.colPresets.length > 0
-            ? "Column layout · " + root.tiledWindows + " windows"
-            : (root.tiledWindows < 2
-               ? "Column layout · open a second window"
-               : "Column layout · unsupported window count")
+          text: "Full-width columns · " + root.tiledWindows + " windows"
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
           font.bold: true
         }
 
+        Text {
+          visible: root.colPresets.length > 0
+          width: parent.width
+          text: "Scrolling strip — the highlighted column fills the screen, the rest scroll sideways"
+          color: root.mutedForeground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
         Grid {
-          visible: root.layoutName === "scrolling" && root.colPresets.length > 0
+          visible: root.colPresets.length > 0
           width: parent.width
           columns: 3
           spacing: Style.space(8)
@@ -949,12 +989,23 @@ Panel {
 
                     Rectangle {
                       required property real modelData
+                      required property int index
                       width: Math.max(Style.space(6),
                         (Math.min(Style.space(64), colCard.width - Style.space(16))
                          - Style.space(2) * (colCard.weights.length - 1)) * modelData)
                       height: Style.space(20)
                       radius: Math.max(2, Style.cornerRadius - 2)
                       color: Util.alpha(root.foreground, 0.48)
+
+                      Image {
+                        anchors.centerIn: parent
+                        width: Math.min(parent.width, parent.height) - 2
+                        height: width
+                        sourceSize.width: 32
+                        sourceSize.height: 32
+                        source: root.windowIcon(index)
+                        visible: source !== "" && status === Image.Ready
+                      }
                     }
                   }
                 }
@@ -980,51 +1031,7 @@ Panel {
           }
         }
 
-        Text {
-          width: parent.width
-          text: "Workspace layout"
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.subtitle
-          font.bold: true
-        }
 
-        Row {
-          width: parent.width
-          spacing: Style.space(8)
-
-          Button {
-            width: (parent.width - parent.spacing) / 2
-            text: (root.layoutName === "dwindle" ? "✓  " : "") + "Dwindle"
-            tooltipText: "Recursive tiling with ratio and split controls"
-            bordered: root.layoutName !== "dwindle"
-            focusable: true
-            hasCursor: root.focusIndex === root.pairCards.length + 1
-            enabled: root.layoutAvailable
-            foreground: root.layoutName === "dwindle" ? root.accent : root.foreground
-            fontFamily: root.fontFamily
-            onClicked: root.setWorkspaceLayout("dwindle")
-            onHovered: function(hovered) {
-              if (hovered) root.focusIndex = root.pairCards.length + 1
-            }
-          }
-
-          Button {
-            width: (parent.width - parent.spacing) / 2
-            text: (root.layoutName === "scrolling" ? "✓  " : "") + "Scrolling"
-            tooltipText: "Horizontal columns with a movable viewport"
-            bordered: root.layoutName !== "scrolling"
-            focusable: true
-            hasCursor: root.focusIndex === root.pairCards.length + 2
-            enabled: root.layoutAvailable
-            foreground: root.layoutName === "scrolling" ? root.accent : root.foreground
-            fontFamily: root.fontFamily
-            onClicked: root.setWorkspaceLayout("scrolling")
-            onHovered: function(hovered) {
-              if (hovered) root.focusIndex = root.pairCards.length + 2
-            }
-          }
-        }
 
         Button {
           visible: root.layoutName === "dwindle" || root.intentRatio !== ""
@@ -1033,12 +1040,12 @@ Panel {
           tooltipText: "Remove saved ratio (D)"
           bordered: true
           focusable: true
-          hasCursor: root.focusIndex === root.pairCards.length + 3
+          hasCursor: root.focusIndex === root.pairCards.length + 1
           enabled: !root.busy && root.intentRatio !== ""
           foreground: root.foreground
           fontFamily: root.fontFamily
           onClicked: root.clearIntent()
-          onHovered: function(hovered) { if (hovered) root.focusIndex = root.pairCards.length + 3 }
+          onHovered: function(hovered) { if (hovered) root.focusIndex = root.pairCards.length + 1 }
         }
 
         Text {
