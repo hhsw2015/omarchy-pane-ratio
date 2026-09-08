@@ -1011,19 +1011,6 @@ def analyze(
             "special_workspace",
             phase="special_workspace",
         )
-    if layout != "dwindle":
-        return unavailable(
-            "Pane Ratio currently supports the Dwindle layout only.",
-            "unsupported_layout",
-        )
-    if workspace_object.get("hasfullscreen") is not False:
-        return unavailable(
-            "Exit fullscreen before changing the pane ratio.", "fullscreen"
-        )
-    if not isinstance(split_bias, dict) or _integer(split_bias.get("int")) != 0:
-        return unavailable(
-            "The Dwindle split_bias option must be 0 (directional).", "split_bias"
-        )
     if not isinstance(clients, list) or len(clients) > MAX_CLIENTS:
         raise PaneRatioError("Hyprland returned an unexpected client list")
 
@@ -1037,6 +1024,24 @@ def analyze(
         if client.get("floating") is not False:
             continue
         tiled.append(client)
+
+    # Ratio intents are Dwindle-only, but the tiled count is reported for
+    # every layout so the panel can offer layout-appropriate actions (the
+    # Scrolling column presets scale with this number).
+    if layout != "dwindle":
+        return unavailable(
+            "Ratio presets apply to the Dwindle layout only.",
+            "unsupported_layout",
+            len(tiled),
+        )
+    if workspace_object.get("hasfullscreen") is not False:
+        return unavailable(
+            "Exit fullscreen before changing the pane ratio.", "fullscreen"
+        )
+    if not isinstance(split_bias, dict) or _integer(split_bias.get("int")) != 0:
+        return unavailable(
+            "The Dwindle split_bias option must be 0 (directional).", "split_bias"
+        )
 
     if len(tiled) < 2:
         return unavailable(
@@ -1473,6 +1478,106 @@ def reconcile_background(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     return reconcile(hyprctl, store, active_identity=identity)
 
 
+COLS_MAX_WINDOWS = 6
+COLS_WEIGHT_RANGE = (1, 20)
+COLS_SPEC_RE = re.compile(r"^[0-9]{1,2}(:[0-9]{1,2}){0,5}$")
+
+
+def _parse_cols_spec(spec: str) -> list[int]:
+    if not COLS_SPEC_RE.fullmatch(spec):
+        raise PaneRatioError(
+            "unsupported column preset", reason_code="unsupported_ratio"
+        )
+    weights = [int(part) for part in spec.split(":")]
+    if len(weights) < 2 or len(weights) > COLS_MAX_WINDOWS:
+        raise PaneRatioError(
+            "unsupported column preset", reason_code="unsupported_ratio"
+        )
+    for weight in weights:
+        if weight < COLS_WEIGHT_RANGE[0] or weight > COLS_WEIGHT_RANGE[1]:
+            raise PaneRatioError(
+                "unsupported column preset", reason_code="unsupported_ratio"
+            )
+    return weights
+
+
+def apply_columns(hyprctl: Hyprctl, store: IntentStore, spec: str) -> LayoutState:
+    """Scrolling layout: size the workspace's columns left-to-right by spec.
+
+    Deterministic by construction — Scrolling is an ordered strip, so column
+    N is simply the Nth tiled window by X position. Each column is focused
+    and resized with `colresize <fraction>` inside one guarded Lua
+    expression; focus returns to the originally focused window.
+    """
+    weights = _parse_cols_spec(spec)
+    deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
+    first = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if not first.identity.supported:
+        return first
+    if first.layout != "scrolling":
+        return first.with_intent(
+            first.intent_ratio,
+            "paused_mode",
+            "Column presets apply to the Scrolling layout only.",
+            "unsupported_layout",
+        )
+    if first.tiled_windows != len(weights):
+        return first.with_intent(
+            first.intent_ratio,
+            "paused_mode",
+            f"This preset needs {len(weights)} tiled windows; found {first.tiled_windows}.",
+            "topology",
+        )
+    total = sum(weights)
+    fractions = [weight / total for weight in weights]
+    fraction_list = ",".join(f"{fraction:.6f}" for fraction in fractions)
+    expression = (
+        "local workspace=hl.get_active_workspace();"
+        f"if workspace==nil or {_lua_workspace_guard(first.identity)} "
+        'or workspace.tiled_layout~="scrolling" '
+        'then error("Pane Ratio target changed") end;'
+        + LUA_NO_SPECIAL_WORKSPACE_GUARD
+        + "local windows={};"
+        "for _,window in ipairs(hl.get_workspace_windows(workspace)) do "
+        "if window.mapped and not window.floating then "
+        'if window.fullscreen~=0 then error("Pane Ratio fullscreen changed") end;'
+        "table.insert(windows,window) end end;"
+        f'if #windows~={len(weights)} then error("Pane Ratio windows changed") end;'
+        "table.sort(windows,function(a,b) return a.at.x<b.at.x end);"
+        "for i=2,#windows do if windows[i].at.x<=windows[i-1].at.x then "
+        'error("Pane Ratio columns overlap") end end;'
+        f"local fractions={{{fraction_list}}};"
+        "local previous=hl.get_active_window();"
+        "for index,window in ipairs(windows) do "
+        "hl.dispatch(hl.dsp.focus({ window = window }));"
+        'hl.dispatch(hl.dsp.layout(string.format("colresize %.6f", fractions[index])));'
+        "end;"
+        "if previous~=nil then hl.dispatch(hl.dsp.focus({ window = previous })) end"
+    )
+    hyprctl.eval(expression, deadline=deadline)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TransientPaneRatioError(
+            "Pane Ratio operation timed out", reason_code="operation_timeout"
+        )
+    time.sleep(min(0.08, remaining))
+    verified = read_state(hyprctl, deadline=deadline, presets=store.presets)
+    if (
+        not _same_workspace(verified.identity, first.identity)
+        or verified.tiled_windows != first.tiled_windows
+    ):
+        raise TransientPaneRatioError(
+            "workspace windows changed before the columns could be verified",
+            reason_code="target_changed",
+        )
+    return verified.with_intent(
+        verified.intent_ratio,
+        "applied",
+        f"Columns sized {spec}.",
+        "applied",
+    )
+
+
 def toggle_split(hyprctl: Hyprctl, store: IntentStore) -> LayoutState:
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
     first = read_state(hyprctl, deadline=deadline, presets=store.presets)
@@ -1739,6 +1844,8 @@ def _operation(arguments: list[str]) -> str:
         return "layout_toggle"
     if arguments[:1] == ["apply"]:
         return "apply"
+    if arguments[:2] == ["cols", "apply"]:
+        return "cols_apply"
     return "unknown"
 
 
@@ -1825,8 +1932,13 @@ def execute(
         state = apply_ratio(hyprctl, arguments[1], presets)
         emit(state.public(operation, ok=state.eligible, presets=presets))
         return 0 if state.eligible else 2
+    if len(arguments) == 3 and arguments[:2] == ["cols", "apply"]:
+        state = apply_columns(hyprctl, store, arguments[2])
+        success = state.phase == "applied"
+        emit(state.public(operation, ok=success, presets=presets))
+        return 0 if success else 2
     raise PaneRatioError(
-        "usage: pane-ratio status | reconcile | reconcile-background | intent set PRESET | intent clear | split toggle | layout set dwindle|scrolling | layout toggle"
+        "usage: pane-ratio status | reconcile | reconcile-background | intent set PRESET | intent clear | split toggle | layout set dwindle|scrolling | layout toggle | cols apply W:W[:W...]"
     )
 
 

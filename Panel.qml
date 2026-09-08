@@ -42,12 +42,51 @@ Panel {
 
   property var presets: ["1:3", "1:2", "1:1", "2:1", "3:1"]
   property var presetShares: [1 / 4, 1 / 3, 1 / 2, 2 / 3, 3 / 4]
+  property string pendingCols: ""
+  property bool colsFinishing: false
+
+  // Scrolling column presets, keyed by tiled-window count. The panel already
+  // refreshes on openwindow/closewindow, so this list follows the workspace
+  // live as windows appear and disappear.
+  readonly property var colPresetsByCount: ({
+    2: ["1:1", "1:2", "2:1", "1:3", "3:1"],
+    3: ["1:1:1", "1:2:1", "2:1:1", "1:1:2"],
+    4: ["1:1:1:1", "1:2:2:1", "2:1:1:2"],
+    5: ["1:1:1:1:1", "1:1:2:1:1"],
+    6: ["1:1:1:1:1:1"]
+  })
+  readonly property var colPresets: root.layoutName === "scrolling"
+    ? (root.colPresetsByCount[root.tiledWindows] || []) : []
+  readonly property bool colsAvailable: !root.busy && root.colPresets.length > 0
+    && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
+
+  function colWeights(spec) {
+    var parts = String(spec).split(":")
+    var weights = []
+    var total = 0
+    for (var index = 0; index < parts.length; index++) {
+      var weight = Number(parts[index])
+      weights.push(weight)
+      total += weight
+    }
+    for (var i = 0; i < weights.length; i++) weights[i] = weights[i] / total
+    return weights
+  }
+
+  function applyCols(spec) {
+    if (!root.colsAvailable || root.colPresets.indexOf(spec) < 0) return
+    root.errorText = ""
+    root.statusText = "Sizing columns " + spec + "…"
+    root.pendingCols = spec
+    root.resetOutput(true)
+    colsProcess.running = true
+  }
   readonly property int maxOutputChars: 16384
   readonly property string cliPath: root.localPath(Qt.resolvedUrl("bin/pane-ratio"))
   readonly property bool busy: statusProcess.running || applyProcess.running || clearProcess.running
     || splitProcess.running || root.statusFinishing || root.applyFinishing
     || layoutProcess.running || root.clearFinishing || root.splitFinishing
-    || root.layoutFinishing
+    || root.layoutFinishing || colsProcess.running || root.colsFinishing
   readonly property bool applying: applyProcess.running || root.applyFinishing
   readonly property bool ratioAvailable: !root.busy && root.errorText === ""
     && (root.workspaceKind === "numbered" || root.workspaceKind === "named")
@@ -369,6 +408,24 @@ Panel {
   }
 
   Process {
+    id: colsProcess
+    command: [root.cliPath, "cols", "apply", root.pendingCols]
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) { root.appendOutput(chunk, true) }
+    }
+    stderr: SplitParser { splitMarker: ""; onRead: function(chunk) {} }
+    onExited: function(exitCode) {
+      root.colsFinishing = true
+      Qt.callLater(function() {
+        root.consumeResult(root.applyOutput, root.applyOutputOverflow, exitCode, true, "")
+        root.colsFinishing = false
+        if (root.refreshPending) Qt.callLater(root.refresh)
+      })
+    }
+  }
+
+  Process {
     id: layoutProcess
     command: root.pendingLayout === "toggle"
       ? [root.cliPath, "layout", "toggle"]
@@ -590,6 +647,88 @@ Panel {
                 cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                 onClicked: root.applyRatio(presetCard.modelData)
                 onEntered: root.focusIndex = presetCard.index + 1
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: root.layoutName === "scrolling"
+          width: parent.width
+          text: root.colPresets.length > 0
+            ? "Column layout · " + root.tiledWindows + " windows"
+            : (root.tiledWindows < 2
+               ? "Column layout · open a second window"
+               : "Column layout · unsupported window count")
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.subtitle
+          font.bold: true
+        }
+
+        Grid {
+          visible: root.layoutName === "scrolling" && root.colPresets.length > 0
+          width: parent.width
+          columns: 3
+          spacing: Style.space(8)
+
+          Repeater {
+            model: root.colPresets
+
+            Rectangle {
+              id: colCard
+              required property string modelData
+              required property int index
+              readonly property var weights: root.colWeights(modelData)
+              readonly property bool available: root.colsAvailable
+              width: (content.width - Style.space(16)) / 3
+              height: Style.space(64)
+              radius: Math.max(4, Style.cornerRadius)
+              color: Util.alpha(root.foreground, 0.035)
+              opacity: available ? 1 : 0.48
+              Accessible.role: Accessible.Button
+              Accessible.name: modelData + " columns"
+              Accessible.onPressAction: root.applyCols(modelData)
+
+              Column {
+                anchors.centerIn: parent
+                spacing: Style.space(5)
+
+                Row {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  spacing: Style.space(2)
+
+                  Repeater {
+                    model: colCard.weights
+
+                    Rectangle {
+                      required property real modelData
+                      width: Math.max(Style.space(6),
+                        (Math.min(Style.space(64), colCard.width - Style.space(16))
+                         - Style.space(2) * (colCard.weights.length - 1)) * modelData)
+                      height: Style.space(20)
+                      radius: Math.max(2, Style.cornerRadius - 2)
+                      color: Util.alpha(root.foreground, 0.48)
+                    }
+                  }
+                }
+
+                Text {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  text: colCard.modelData
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                enabled: colCard.available
+                hoverEnabled: true
+                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: root.applyCols(colCard.modelData)
               }
             }
           }
